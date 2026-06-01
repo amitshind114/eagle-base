@@ -1,5 +1,18 @@
 """Eagle-Base Strategies Module — Priority 4.
 
-Plug-and-play strategy system. Each strategy is a Python file
-in strategies/plugins/ that inherits from BaseStrategy.
+Strategy plugin system.
+All strategies inherit from BaseStrategy and implement on_bar().
 """
+
+from strategies.base import BaseStrategy, Signal
+from strategies.registry import StrategyRegistry
+from strategies.sma_crossover import SMACrossoverStrategy
+from strategies.rsi_strategy import RSIStrategy
+
+__all__ = [
+    "BaseStrategy",
+    "Signal",
+    "StrategyRegistry",
+    "SMACrossoverStrategy",
+    "RSIStrategy",
+]

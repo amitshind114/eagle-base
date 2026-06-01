@@ -1,39 +1,70 @@
 """Strategy Registry — Priority 4.
 
-Auto-discovers and loads strategy plugins from strategies/plugins/.
-Strategies are loaded as Python modules at runtime.
+Register and load strategies by name.
+Allows dynamic strategy loading for UI and API.
 
-TODO (Phase 4 - Priority 4):
-- Implement auto-discovery
-- Implement validation (must inherit BaseStrategy)
-- Implement registry CRUD
+Usage:
+    registry = StrategyRegistry()
+    registry.register(SMACrossoverStrategy)
+    strategy = registry.get("sma_crossover", fast=10, slow=30)
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import Type
 
 from core.logger import logger
-
-PLUGINS_DIR = Path(__file__).parent / "plugins"
-PLUGINS_DIR.mkdir(exist_ok=True)
+from strategies.base import BaseStrategy
 
 
 class StrategyRegistry:
-    """Manages discovery and loading of strategy plugins."""
+    """Registry for strategy classes — register once, instantiate anywhere."""
 
     def __init__(self):
-        self._strategies: dict = {}
+        self._registry: dict[str, Type[BaseStrategy]] = {}
+        self._load_defaults()
 
-    def discover(self) -> list[str]:
-        """Discover all .py files in strategies/plugins/. TODO: Phase 4 Priority 4."""
-        logger.info("Discovering strategies...")
-        raise NotImplementedError("TODO: Phase 4 Priority 4")
+    def _load_defaults(self) -> None:
+        """Auto-register built-in strategies."""
+        from strategies.sma_crossover import SMACrossoverStrategy
+        from strategies.rsi_strategy import RSIStrategy
+        self.register(SMACrossoverStrategy)
+        self.register(RSIStrategy)
+        logger.info(f"[registry] Loaded {len(self._registry)} strategies")
 
-    def load(self, name: str):
-        """Load a strategy by name. TODO: Phase 4 Priority 4."""
-        raise NotImplementedError("TODO: Phase 4 Priority 4")
+    def register(self, strategy_class: Type[BaseStrategy]) -> None:
+        """Register a strategy class by its name attribute."""
+        self._registry[strategy_class.name] = strategy_class
+        logger.debug(f"[registry] Registered: {strategy_class.name}")
 
-    def list_all(self) -> list[str]:
-        """Return list of all registered strategy names."""
-        return list(self._strategies.keys())
+    def get(self, name: str, **params) -> BaseStrategy:
+        """Instantiate a registered strategy by name.
+
+        Args:
+            name:   Strategy name e.g. 'sma_crossover', 'rsi_strategy'
+            **params: Parameters passed to strategy __init__
+
+        Returns:
+            Instantiated strategy object
+
+        Raises:
+            KeyError if strategy name not found
+        """
+        if name not in self._registry:
+            available = list(self._registry.keys())
+            raise KeyError(f"Strategy '{name}' not found. Available: {available}")
+        return self._registry[name](**params)
+
+    def list_strategies(self) -> list[dict]:
+        """List all registered strategies with metadata."""
+        return [
+            cls().__class__.__dict__ and cls().info()
+            for cls in self._registry.values()
+        ]
+
+    def names(self) -> list[str]:
+        """Return list of registered strategy names."""
+        return list(self._registry.keys())
+
+    def count(self) -> int:
+        return len(self._registry)
