@@ -1,5 +1,4 @@
-# Eagle-Base Requirements
-# Install: pip install -r requirements.txt
+# Eagle-Base Requirements — Phase 4
 
 # Core
 python-dotenv>=1.0.0
@@ -12,6 +11,7 @@ numpy>=1.24.0
 yfinance>=0.2.0
 requests>=2.31.0
 httpx>=0.24.0
+scipy>=1.11.0
 
 # API
 fastapi>=0.104.0
@@ -21,10 +21,8 @@ uvicorn[standard]>=0.24.0
 streamlit>=1.28.0
 plotly>=5.17.0
 
-# Testing
+# Dev
 pytest>=7.4.0
 pytest-cov>=4.1.0
-
-# Code Quality
 ruff>=0.1.0
 black>=23.0.0
