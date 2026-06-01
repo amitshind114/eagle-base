@@ -1,5 +1,10 @@
 """Eagle-Base Data Module — Priority 1.
 
-Handles all market data fetching, storage, caching, and feeds.
-Supports historical OHLCV, live quotes, and tick data.
+Handles all market data fetching, caching, and feeds.
+Providers: yfinance (default), Angel One SmartAPI.
 """
+
+from data.fetcher import YFinanceProvider, AngelOneProvider
+from data.cache import DataCache
+
+__all__ = ["YFinanceProvider", "AngelOneProvider", "DataCache"]
