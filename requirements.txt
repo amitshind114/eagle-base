@@ -1,0 +1,35 @@
+# Eagle-Base Requirements
+# Install: pip install -r requirements.txt
+
+# Core
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+loguru>=0.7.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.0
+requests>=2.31.0
+httpx>=0.24.0
+
+# API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# UI
+streamlit>=1.28.0
+plotly>=5.17.0
+
+# Broker
+# smartapi-python>=1.3.8  # Uncomment when Angel One integration is needed
+
+# Backtesting
+# backtrader>=1.9.78  # Uncomment when backtesting module is active
+
+# AI/ML
+# anthropic>=0.18.0   # Uncomment when AI module is active
+
+# Code Quality
+ruff>=0.1.0
+black>=23.0.0

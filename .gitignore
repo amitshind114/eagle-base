@@ -1,0 +1,47 @@
+# Eagle-Base .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Environment Variables (NEVER commit secrets)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/launch.json
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Data files
+data/raw/
+data/cache/
+*.csv
+*.parquet
+*.db
+*.sqlite
+
+# Logs
+logs/
+*.log
+
+# Reports output
+reporting/output/
+
+# OS
+.DS_Store
+Thumbs.db
