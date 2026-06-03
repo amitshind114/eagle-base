@@ -1,46 +1,40 @@
-"""Eagle-Base Configuration Manager.
-
-Loads and validates all environment variables and app settings.
-All other modules should import config from here.
-"""
+"""Central application settings loaded from .env."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from dotenv import load_dotenv
-from pydantic import BaseSettings
-
-load_dotenv()
-
-ROOT_DIR = Path(__file__).parent.parent
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # App
-    app_env: str = "development"
-    app_debug: bool = True
-    app_port: int = 8000
+    app_name: str = "Eagle-Base"
+    app_version: str = "0.1.0"
+    debug: bool = False
 
-    # Broker
+    # Data
+    default_exchange: str = "NSE"
+    default_interval: str = "1d"
+    default_period: str = "1y"
+
+    # Risk defaults
+    default_capital: float = 500_000.0
+    max_risk_per_trade_pct: float = 1.0
+    max_position_exposure_pct: float = 20.0
+    max_daily_loss: float = 10_000.0
+    max_open_positions: int = 5
+    max_drawdown_pct: float = 15.0
+
+    # Paper trading
+    paper_capital: float = 500_000.0
+    paper_brokerage_pct: float = 0.03
+
+    # Angel One (optional — for live later)
     angel_api_key: str = ""
     angel_client_id: str = ""
     angel_password: str = ""
     angel_totp_secret: str = ""
 
-    # AI
-    anthropic_api_key: str = ""
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-
-def get_settings() -> Settings:
-    """Return application settings singleton."""
-    return Settings()
-
-
-settings = get_settings()
+settings = Settings()

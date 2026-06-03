@@ -1,1 +1,1 @@
-"""Eagle-Base Test Suite."""
+"""Eagle-Base test suite."""

@@ -1,10 +1,6 @@
-"""Eagle-Base Data Module — Priority 1.
+"""Eagle-Base Data Module — OHLCV fetching and caching."""
 
-Handles all market data fetching, caching, and feeds.
-Providers: yfinance (default), Angel One SmartAPI.
-"""
+from .fetcher import DataFetcher
+from .models import OHLCV
 
-from data.fetcher import YFinanceProvider, AngelOneProvider
-from data.cache import DataCache
-
-__all__ = ["YFinanceProvider", "AngelOneProvider", "DataCache"]
+__all__ = ["DataFetcher", "OHLCV"]

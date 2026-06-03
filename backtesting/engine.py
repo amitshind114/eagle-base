@@ -1,146 +1,90 @@
-"""Backtest Engine — Priority 3.
-
-Bar-by-bar simulation engine.
-Iterates over OHLCV data, calls strategy.on_bar() each step,
-collects signals, executes simulated trades, builds equity curve.
-
-Usage:
-    engine = BacktestEngine(symbol="RELIANCE.NS", initial_capital=100000)
-    result = engine.run(df, strategy)
-"""
+"""Core backtesting engine — runs strategies on historical OHLCV data."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import numpy as np
 import pandas as pd
 
-from backtesting.result import BacktestResult, Trade
-from backtesting.metrics import MetricsCalculator
-from core.logger import logger
+from core.exceptions import BacktestError, InsufficientDataError
+from core.logger import get_logger
+from .models import BacktestResult
 
-if TYPE_CHECKING:
-    from strategies.base import BaseStrategy
+log = get_logger("backtesting.engine")
 
 
 class BacktestEngine:
-    """Bar-by-bar backtesting engine with long-only simulation."""
+    """Run a signal series against historical price data."""
 
-    def __init__(
+    def run(
         self,
-        symbol: str = "UNKNOWN",
-        initial_capital: float = 100_000.0,
-        commission_pct: float = 0.0003,   # 0.03% per leg (typical NSE)
-        slippage_pct: float = 0.0001,     # 0.01% slippage
-        position_size_pct: float = 0.95,  # Use 95% of capital per trade
-    ):
-        self.symbol = symbol
-        self.initial_capital = initial_capital
-        self.commission_pct = commission_pct
-        self.slippage_pct = slippage_pct
-        self.position_size_pct = position_size_pct
-        self._metrics = MetricsCalculator()
-
-    def run(self, df: pd.DataFrame, strategy: "BaseStrategy") -> BacktestResult:
-        """Run backtest over OHLCV DataFrame.
+        df: pd.DataFrame,
+        signals: pd.Series,
+        capital: float = 100_000.0,
+        commission_pct: float = 0.03,
+    ) -> BacktestResult:
+        """
+        Run backtest.
 
         Args:
-            df:       OHLCV DataFrame with columns Open, High, Low, Close, Volume
-            strategy: Any strategy inheriting BaseStrategy
+            df: OHLCV DataFrame indexed by datetime.
+            signals: Series of 1 (long), -1 (short), 0 (flat) aligned to df.
+            capital: Starting capital in INR.
+            commission_pct: Commission per trade as percentage.
 
         Returns:
-            BacktestResult with trades, equity curve, metrics
+            BacktestResult with full metrics.
         """
-        logger.info(f"[engine] Starting backtest: {strategy.name} on {self.symbol} ({len(df)} bars)")
+        if df.empty or len(df) < 10:
+            raise InsufficientDataError("Need at least 10 bars to backtest")
 
-        result = BacktestResult(
-            symbol=self.symbol,
-            strategy_name=strategy.name,
-            initial_capital=self.initial_capital,
+        if len(signals) != len(df):
+            raise BacktestError("signals length must match df length")
+
+        df = df.copy()
+        df["signal"] = signals.values
+        df["returns"] = df["Close"].pct_change().fillna(0)
+        df["strategy_returns"] = df["signal"].shift(1).fillna(0) * df["returns"]
+
+        # Apply commission on signal changes
+        signal_changes = df["signal"].diff().abs() > 0
+        df.loc[signal_changes, "strategy_returns"] -= commission_pct / 100
+
+        df["equity"] = capital * (1 + df["strategy_returns"]).cumprod()
+        df["buy_hold"] = capital * (1 + df["returns"]).cumprod()
+        df["drawdown"] = (df["equity"] / df["equity"].cummax()) - 1
+
+        total_return = (df["equity"].iloc[-1] - capital) / capital * 100
+        bh_return = (df["buy_hold"].iloc[-1] - capital) / capital * 100
+        max_dd = float(df["drawdown"].min() * 100)
+        std = df["strategy_returns"].std()
+        sharpe = (
+            float(df["strategy_returns"].mean() / std * np.sqrt(252))
+            if std > 0 else 0.0
+        )
+        wins = int((df["strategy_returns"] > 0).sum())
+        losses = int((df["strategy_returns"] < 0).sum())
+        total_trades = wins + losses
+        win_rate = wins / total_trades * 100 if total_trades > 0 else 0.0
+        avg_win = float(df.loc[df["strategy_returns"] > 0, "strategy_returns"].mean() * 100) if wins > 0 else 0.0
+        avg_loss = float(df.loc[df["strategy_returns"] < 0, "strategy_returns"].mean() * 100) if losses > 0 else 0.0
+        profit_factor = abs(avg_win * wins / (avg_loss * losses)) if avg_loss != 0 and losses > 0 else 0.0
+
+        log.info(
+            f"Backtest done | Return={total_return:.1f}% Sharpe={sharpe:.2f} MaxDD={max_dd:.1f}% WR={win_rate:.1f}%"
         )
 
-        capital = self.initial_capital
-        position = 0       # shares held
-        entry_price = 0.0
-        entry_date = ""
-        equity_curve = [capital]
-
-        strategy.reset()
-
-        for i in range(len(df)):
-            bar = df.iloc[i]
-            close = float(bar["Close"])
-            date_str = str(df.index[i])[:10]
-
-            # Feed bar to strategy
-            signal = strategy.on_bar(df.iloc[: i + 1])
-
-            # --- ENTRY ---
-            if signal == "BUY" and position == 0:
-                entry_px = close * (1 + self.slippage_pct)
-                commission = entry_px * self.commission_pct
-                qty = int((capital * self.position_size_pct) / (entry_px + commission))
-                if qty > 0:
-                    position = qty
-                    entry_price = entry_px
-                    entry_date = date_str
-                    capital -= qty * (entry_px + commission)
-                    logger.debug(f"[engine] BUY  {qty} @ {entry_px:.2f} on {date_str}")
-
-            # --- EXIT ---
-            elif signal == "SELL" and position > 0:
-                exit_px = close * (1 - self.slippage_pct)
-                commission = exit_px * self.commission_pct
-                proceeds = position * (exit_px - commission)
-                pnl = proceeds - position * entry_price
-                pnl_pct = pnl / (position * entry_price) * 100 if entry_price else 0
-
-                result.trades.append(Trade(
-                    symbol=self.symbol,
-                    direction="LONG",
-                    entry_date=entry_date,
-                    exit_date=date_str,
-                    entry_price=entry_price,
-                    exit_price=exit_px,
-                    quantity=position,
-                    pnl=pnl,
-                    pnl_pct=pnl_pct,
-                    exit_reason="SIGNAL",
-                ))
-                capital += proceeds
-                logger.debug(f"[engine] SELL {position} @ {exit_px:.2f} on {date_str} | PnL: {pnl:.2f}")
-                position = 0
-                entry_price = 0.0
-
-            # Mark-to-market equity
-            mtm = capital + (position * close)
-            equity_curve.append(mtm)
-
-        # Force-close open position at end of data
-        if position > 0:
-            last_close = float(df.iloc[-1]["Close"])
-            exit_px = last_close * (1 - self.slippage_pct)
-            commission = exit_px * self.commission_pct
-            proceeds = position * (exit_px - commission)
-            pnl = proceeds - position * entry_price
-            pnl_pct = pnl / (position * entry_price) * 100 if entry_price else 0
-            result.trades.append(Trade(
-                symbol=self.symbol,
-                direction="LONG",
-                entry_date=entry_date,
-                exit_date=str(df.index[-1])[:10],
-                entry_price=entry_price,
-                exit_price=exit_px,
-                quantity=position,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                exit_reason="END_OF_DATA",
-            ))
-            capital += proceeds
-            equity_curve[-1] = capital
-
-        result.equity_curve = equity_curve
-        result.metrics = self._metrics.compute(result)
-
-        logger.info(f"[engine] Done — {result.total_trades} trades | Return: {result.total_return_pct:.2f}%")
-        return result
+        return BacktestResult(
+            equity_curve=df["equity"],
+            buy_hold_curve=df["buy_hold"],
+            drawdown_series=df["drawdown"],
+            total_return_pct=round(total_return, 2),
+            buy_hold_return_pct=round(bh_return, 2),
+            sharpe_ratio=round(sharpe, 3),
+            max_drawdown_pct=round(max_dd, 2),
+            win_rate_pct=round(win_rate, 2),
+            total_trades=total_trades,
+            profit_factor=round(profit_factor, 3),
+            avg_win_pct=round(avg_win, 3),
+            avg_loss_pct=round(avg_loss, 3),
+            final_capital=round(float(df["equity"].iloc[-1]), 2),
+        )

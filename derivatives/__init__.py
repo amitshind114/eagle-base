@@ -1,6 +1,6 @@
-"""Eagle-Base Derivatives Module — Priority 9.
+"""Eagle-Base Derivatives — Options pricing and Greeks."""
 
-Options, futures, and derivatives specific logic.
-Includes Greeks calculation, options chain analysis,
-and F&O strategy support.
-"""
+from .options import OptionsChain
+from .models import OptionContract
+
+__all__ = ["OptionsChain", "OptionContract"]

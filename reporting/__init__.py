@@ -1,5 +1,5 @@
-"""Eagle-Base Reporting Module — Priority 5.
+"""Eagle-Base Reporting module."""
 
-Generates performance reports, equity charts, trade summaries,
-and exports to PDF/CSV/Excel.
-"""
+from .generator import ReportGenerator
+
+__all__ = ["ReportGenerator"]

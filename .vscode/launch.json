@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Streamlit App",
+      "type": "python",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "ui/app.py", "--server.port=8501"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Run FastAPI Server",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["api.main:app", "--reload", "--port=8000"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Run Tests",
+      "type": "python",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/", "-v", "--cov=."],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

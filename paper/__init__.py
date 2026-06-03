@@ -1,5 +1,6 @@
-"""Eagle-Base Paper Trading Module — Priority 7.
+"""Eagle-Base Paper Trading module."""
 
-Simulates order execution locally without real broker connection.
-Uses live market data for realistic simulation.
-"""
+from .broker import PaperBroker
+from .models import Order, Position, Portfolio
+
+__all__ = ["PaperBroker", "Order", "Position", "Portfolio"]

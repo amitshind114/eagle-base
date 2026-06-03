@@ -1,5 +1,6 @@
-"""Eagle-Base Core Module.
+"""Eagle-Base Core — shared config, logger, base classes."""
 
-Shared base classes, configuration, and logging utilities
-used across all other modules.
-"""
+from .config import Settings
+from .logger import get_logger
+
+__all__ = ["Settings", "get_logger"]

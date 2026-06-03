@@ -1,0 +1,14 @@
+{
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.pylance",
+    "ms-python.black-formatter",
+    "charliermarsh.ruff",
+    "ms-python.vscode-pylance",
+    "njpwerner.autodocstring",
+    "eamodio.gitlens",
+    "mhutchie.git-graph",
+    "gruntfuggly.todo-tree",
+    "mechatroner.rainbow-csv"
+  ]
+}

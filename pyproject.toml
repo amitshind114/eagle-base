@@ -1,12 +1,31 @@
-[tool.ruff]
-line-length = 88
-select = ["E", "F", "I", "N", "UP", "B"]
-ignore = ["E501"]
-
 [tool.black]
 line-length = 88
 target-version = ["py311"]
+include = '\.pyi?$'
+extend-exclude = '''
+(
+  .venv
+  | __pycache__
+)
+'''
 
-[tool.pylance]
-pythonVersion = "3.11"
-typeCheckingMode = "basic"
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+extend-select = ["I", "N", "UP", "B", "A", "C4", "PT", "RET", "SIM"]
+ignore = ["E501", "B008", "RET504"]
+exclude = [".venv", "__pycache__", "*.pyc"]
+
+[tool.ruff.isort]
+known-first-party = ["core", "data", "instruments", "backtesting", "strategies", "reporting", "risk", "paper", "ai", "derivatives", "live", "api", "domain"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["core", "data", "instruments", "backtesting", "strategies", "reporting", "risk", "paper", "ai", "derivatives"]
+omit = ["tests/*", ".venv/*", "ui/*"]

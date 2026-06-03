@@ -1,0 +1,33 @@
+{
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "core",
+    "data",
+    "instruments",
+    "backtesting",
+    "strategies",
+    "reporting",
+    "risk",
+    "paper",
+    "ai",
+    "derivatives",
+    "live",
+    "api",
+    "ui",
+    "domain",
+    "tests"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/*.pyc",
+    ".venv"
+  ],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "reportUnusedImport": true,
+  "reportUnusedVariable": true
+}

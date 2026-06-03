@@ -1,10 +1,6 @@
-"""Eagle-Base Instruments Module — Priority 2.
+"""Eagle-Base Instruments — symbol registry and resolution."""
 
-Instrument resolution, symbol lookup, and metadata.
-Maps human-readable symbols to exchange tokens and instrument info.
-"""
+from .registry import InstrumentRegistry
+from .models import Instrument
 
-from instruments.resolver import InstrumentResolver, Instrument
-from instruments.master import InstrumentMaster
-
-__all__ = ["InstrumentResolver", "Instrument", "InstrumentMaster"]
+__all__ = ["InstrumentRegistry", "Instrument"]

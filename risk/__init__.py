@@ -1,5 +1,6 @@
-"""Eagle-Base Risk Module — Priority 6.
+"""Eagle-Base Risk Manager."""
 
-Risk management, position sizing, exposure limits,
-and pre-trade risk checks.
-"""
+from .manager import RiskManager
+from .models import RiskMetrics, PositionSizeResult
+
+__all__ = ["RiskManager", "RiskMetrics", "PositionSizeResult"]

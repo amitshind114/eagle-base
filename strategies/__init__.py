@@ -1,18 +1,9 @@
-"""Eagle-Base Strategies Module — Priority 4.
+"""Eagle-Base Strategies — signal generators."""
 
-Strategy plugin system.
-All strategies inherit from BaseStrategy and implement on_bar().
-"""
+from .base import BaseStrategy
+from .sma_crossover import SmaCrossover
+from .ema_crossover import EmaCrossover
+from .rsi_mean_reversion import RsiMeanReversion
+from .macd_signal import MacdSignal
 
-from strategies.base import BaseStrategy, Signal
-from strategies.registry import StrategyRegistry
-from strategies.sma_crossover import SMACrossoverStrategy
-from strategies.rsi_strategy import RSIStrategy
-
-__all__ = [
-    "BaseStrategy",
-    "Signal",
-    "StrategyRegistry",
-    "SMACrossoverStrategy",
-    "RSIStrategy",
-]
+__all__ = ["BaseStrategy", "SmaCrossover", "EmaCrossover", "RsiMeanReversion", "MacdSignal"]

@@ -1,5 +1,6 @@
-"""Eagle-Base AI Module — Priority 8.
+"""Eagle-Base AI Signal Analyzer."""
 
-AI/ML integration for signal enhancement, market analysis,
-and strategy optimization. Uses Claude API.
-"""
+from .scanner import SignalScanner
+from .models import SignalResult
+
+__all__ = ["SignalScanner", "SignalResult"]

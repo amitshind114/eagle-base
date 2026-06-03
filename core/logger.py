@@ -1,8 +1,4 @@
-"""Eagle-Base Logger.
-
-Centralized logging using loguru. All modules should import
-logger from here instead of using print() or standard logging.
-"""
+"""Centralised logger using loguru."""
 
 from __future__ import annotations
 
@@ -11,27 +7,24 @@ from pathlib import Path
 
 from loguru import logger
 
-LOG_DIR = Path(__file__).parent.parent / "logs"
+LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-# Remove default handler
 logger.remove()
-
-# Console handler
 logger.add(
-    sys.stdout,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | <cyan>{name}</cyan> - {message}",
-    level="DEBUG",
+    sys.stderr,
+    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> — <level>{message}</level>",
+    level="INFO",
     colorize=True,
 )
-
-# File handler
 logger.add(
-    LOG_DIR / "eagle-base.log",
-    rotation="10 MB",
+    LOG_DIR / "eagle_{time:YYYY-MM-DD}.log",
+    rotation="1 day",
     retention="7 days",
-    level="INFO",
-    format="{time} | {level} | {name} | {message}",
+    level="DEBUG",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} — {message}",
 )
 
-__all__ = ["logger"]
+
+def get_logger(name: str):
+    return logger.bind(name=name)
