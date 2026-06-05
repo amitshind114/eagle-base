@@ -1,118 +1,169 @@
-"""Instrument Resolver — Priority 2.
+"""Instrument resolver — Phase 1.
 
-Resolves human-readable symbols to Instrument objects.
-Built-in registry of 15 NSE/BSE symbols. Load full master for 20,000+.
+Resolves symbol strings → canonical Instrument objects.
+Handles:
+  - EQ symbols:  RELIANCE → RELIANCE-EQ
+  - YF symbols:  RELIANCE.NS → RELIANCE-EQ
+  - FUT symbols: RELIANCE-FUT → nearest future
+  - Expiry:      nearest/next monthly expiry
+  - Option chain: all strikes for a given underlying + expiry
 
 Usage:
-    resolver = InstrumentResolver()
-    instrument = resolver.resolve("RELIANCE", "NSE")
-    print(instrument.token, instrument.lot_size)
+    from instruments.resolver import InstrumentResolver
+    r = InstrumentResolver()
+    inst     = r.resolve("RELIANCE")         # → RELIANCE-EQ
+    fut      = r.resolve("RELIANCE-FUT")     # → FUT instrument
+    expiry   = r.resolve_expiry("RELIANCE")  # → nearest date
+    chain    = r.resolve_chain("RELIANCE")   # → list[Instrument] CE+PE
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from datetime import date, timedelta
+from typing import List, Optional
 
-from core.logger import logger
+from core.logger import get_logger
+from .models import Instrument
+from .storage import InstrumentStore
 
-
-@dataclass
-class Instrument:
-    """Represents a single tradeable instrument."""
-
-    symbol: str
-    token: str
-    exchange: str           # NSE, BSE, NFO, MCX, CDS
-    instrument_type: str    # EQ, FUT, CE, PE, IDX
-    name: str = ""
-    lot_size: int = 1
-    tick_size: float = 0.05
-    expiry: str = ""        # For F&O: 'YYYY-MM-DD'
-    strike: float = 0.0     # For options
-    segment: str = ""       # EQUITY, DERIVATIVE
-
-    def __str__(self) -> str:
-        return f"{self.exchange}:{self.symbol} [{self.instrument_type}]"
-
-    @property
-    def is_equity(self) -> bool:
-        return self.instrument_type == "EQ"
-
-    @property
-    def is_derivative(self) -> bool:
-        return self.instrument_type in ("FUT", "CE", "PE")
+log = get_logger("instruments.resolver")
 
 
 class InstrumentResolver:
-    """Resolves symbols to Instrument objects using a local registry."""
+    """Resolves raw symbol strings to canonical Instrument objects."""
 
-    _BUILTIN: dict[str, dict] = {
-        "NIFTY":      {"token": "26000", "exchange": "NSE", "type": "IDX", "name": "Nifty 50",                "lot_size": 75},
-        "BANKNIFTY":  {"token": "26009", "exchange": "NSE", "type": "IDX", "name": "Bank Nifty",             "lot_size": 30},
-        "SENSEX":     {"token": "1",     "exchange": "BSE", "type": "IDX", "name": "BSE Sensex",             "lot_size": 20},
-        "RELIANCE":   {"token": "2885",  "exchange": "NSE", "type": "EQ",  "name": "Reliance Industries",   "lot_size": 1},
-        "TCS":        {"token": "11536", "exchange": "NSE", "type": "EQ",  "name": "Tata Consultancy Svcs", "lot_size": 1},
-        "INFY":       {"token": "1594",  "exchange": "NSE", "type": "EQ",  "name": "Infosys",               "lot_size": 1},
-        "HDFCBANK":   {"token": "1333",  "exchange": "NSE", "type": "EQ",  "name": "HDFC Bank",             "lot_size": 1},
-        "ICICIBANK":  {"token": "4963",  "exchange": "NSE", "type": "EQ",  "name": "ICICI Bank",            "lot_size": 1},
-        "SBIN":       {"token": "3045",  "exchange": "NSE", "type": "EQ",  "name": "State Bank of India",   "lot_size": 1},
-        "WIPRO":      {"token": "3787",  "exchange": "NSE", "type": "EQ",  "name": "Wipro",                 "lot_size": 1},
-        "AXISBANK":   {"token": "5900",  "exchange": "NSE", "type": "EQ",  "name": "Axis Bank",             "lot_size": 1},
-        "TATAMOTORS": {"token": "3456",  "exchange": "NSE", "type": "EQ",  "name": "Tata Motors",           "lot_size": 1},
-        "TATASTEEL":  {"token": "3499",  "exchange": "NSE", "type": "EQ",  "name": "Tata Steel",            "lot_size": 1},
-        "BAJFINANCE": {"token": "317",   "exchange": "NSE", "type": "EQ",  "name": "Bajaj Finance",         "lot_size": 1},
-        "MARUTI":     {"token": "10999", "exchange": "NSE", "type": "EQ",  "name": "Maruti Suzuki",         "lot_size": 1},
-    }
+    def __init__(self) -> None:
+        self._store = InstrumentStore()
 
-    def __init__(self):
-        self._registry: dict[str, Instrument] = {}
-        self._load_builtin()
+    # ── Main resolver ─────────────────────────────────────────────────────
 
-    def _load_builtin(self) -> None:
-        for symbol, meta in self._BUILTIN.items():
-            self._registry[symbol.upper()] = Instrument(
-                symbol=symbol,
-                token=meta["token"],
-                exchange=meta["exchange"],
-                instrument_type=meta["type"],
-                name=meta["name"],
-                lot_size=meta.get("lot_size", 1),
-            )
-        logger.info(f"[instruments] Loaded {len(self._registry)} built-in instruments")
-
-    def resolve(self, symbol: str, exchange: str = "NSE") -> Optional[Instrument]:
-        """Resolve symbol string to an Instrument object.
-
-        Returns Instrument if found, None otherwise.
+    def resolve(self, raw: str) -> Optional[Instrument]:
         """
-        key = symbol.upper().strip()
-        instrument = self._registry.get(key)
-        if instrument:
-            logger.debug(f"[instruments] Resolved: {symbol} → {instrument}")
-            return instrument
-        logger.warning(f"[instruments] Not found: {symbol} — load full master for more symbols")
+        Resolve any symbol string to a canonical Instrument.
+        Handles: RELIANCE / RELIANCE.NS / RELIANCE-EQ / RELIANCE-FUT
+        """
+        if not raw:
+            return None
+
+        # Normalize
+        sym = raw.strip().upper()
+
+        # 1. Direct lookup
+        inst = self._store.get_by_symbol(sym)
+        if inst:
+            return inst
+
+        # 2. YF suffix strip: RELIANCE.NS → RELIANCE
+        if sym.endswith(".NS") or sym.endswith(".BO"):
+            base = sym.rsplit(".", 1)[0]
+            inst = self._store.get_by_symbol(f"{base}-EQ")
+            if inst:
+                return inst
+
+        # 3. Bare symbol → try EQ first, then IDX
+        for seg in ("EQ", "IDX", "FUT"):
+            inst = self._store.get_by_symbol(f"{sym}-{seg}")
+            if inst:
+                return inst
+
+        # 4. Fallback: search and return best match
+        results = self._store.search(sym, limit=1)
+        if results:
+            log.debug(f"resolve('{raw}') → fallback search → {results[0].symbol}")
+            return results[0]
+
+        log.warning(f"resolve('{raw}') → not found")
         return None
 
-    def search(self, query: str, limit: int = 10) -> list[Instrument]:
-        """Search instruments by partial symbol or name."""
-        q = query.upper().strip()
-        results = [
-            inst for key, inst in self._registry.items()
-            if q in key or q in inst.name.upper()
-        ]
-        return results[:limit]
+    def resolve_yf_symbol(self, instrument: Instrument) -> str:
+        """
+        Return the Yahoo Finance ticker string for an instrument.
+        Equity: RELIANCE.NS
+        Index:  ^NSEI
+        Futures/Options: yf_symbol field if available
+        """
+        if instrument.yf_symbol:
+            return instrument.yf_symbol
+        if instrument.is_equity:
+            base = (instrument.underlying or instrument.symbol.replace("-EQ", ""))
+            return f"{base}.NS"
+        if instrument.is_index:
+            _idx_map = {
+                "NIFTY50": "^NSEI",
+                "NIFTY": "^NSEI",
+                "BANKNIFTY": "^NSEBANK",
+                "SENSEX": "^BSESN",
+            }
+            key = instrument.underlying or instrument.symbol.replace("-IDX", "")
+            return _idx_map.get(key.upper(), f"{key}.NS")
+        return instrument.yf_symbol or ""
 
-    def register(self, instrument: Instrument) -> None:
-        """Manually add an instrument to the registry."""
-        self._registry[instrument.symbol.upper()] = instrument
-        logger.debug(f"[instruments] Registered: {instrument}")
+    # ── Expiry resolver ───────────────────────────────────────────────────
 
-    def list_all(self, exchange: str = "") -> list[Instrument]:
-        """List all instruments, optionally filtered by exchange."""
-        if exchange:
-            return [i for i in self._registry.values() if i.exchange == exchange.upper()]
-        return list(self._registry.values())
+    def resolve_expiry(
+        self,
+        underlying: str,
+        which: str = "nearest",
+    ) -> Optional[date]:
+        """
+        Return nearest or next monthly expiry for an underlying.
+        which: 'nearest' | 'next' | 'far'
+        """
+        futures = self._store.list_by_segment("FUT")
+        expiries = sorted(
+            {
+                f.expiry
+                for f in futures
+                if f.underlying == underlying.upper() and f.expiry and f.expiry >= date.today()
+            }
+        )
+        if not expiries:
+            # Fallback: compute last Thursday of current month
+            return self._last_thursday_of_month(date.today())
 
-    def count(self) -> int:
-        return len(self._registry)
+        if which == "nearest":
+            return expiries[0]
+        elif which == "next" and len(expiries) > 1:
+            return expiries[1]
+        elif which == "far" and len(expiries) > 2:
+            return expiries[2]
+        return expiries[0]
+
+    # ── Option chain resolver ─────────────────────────────────────────────
+
+    def resolve_chain(
+        self,
+        underlying: str,
+        expiry: Optional[date] = None,
+        limit_strikes: int = 20,
+    ) -> List[Instrument]:
+        """
+        Return all CE + PE instruments for underlying + expiry.
+        If expiry is None, uses nearest expiry.
+        """
+        if expiry is None:
+            expiry = self.resolve_expiry(underlying)
+
+        chain = []
+        for seg in ("CE", "PE"):
+            opts = self._store.list_by_segment(seg)
+            filtered = [
+                o for o in opts
+                if o.underlying == underlying.upper()
+                and (expiry is None or o.expiry == expiry)
+            ]
+            filtered.sort(key=lambda x: x.strike or 0)
+            chain.extend(filtered[:limit_strikes])
+        return chain
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _last_thursday_of_month(d: date) -> date:
+        """Compute the last Thursday of the given date's month."""
+        import calendar
+        year, month = d.year, d.month
+        last_day = calendar.monthrange(year, month)[1]
+        last = date(year, month, last_day)
+        offset = (last.weekday() - 3) % 7  # 3 = Thursday
+        return last - timedelta(days=offset)

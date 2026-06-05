@@ -1,6 +1,17 @@
-"""Eagle-Base Instruments — symbol registry and resolution."""
+"""Instruments package — Phase 1."""
 
-from .registry import InstrumentRegistry
 from .models import Instrument
+from .registry import InstrumentRegistry
+from .resolver import InstrumentResolver
+from .search import InstrumentSearch
+from .storage import InstrumentStore
+from .downloader import InstrumentDownloader
 
-__all__ = ["InstrumentRegistry", "Instrument"]
+__all__ = [
+    "Instrument",
+    "InstrumentRegistry",
+    "InstrumentResolver",
+    "InstrumentSearch",
+    "InstrumentStore",
+    "InstrumentDownloader",
+]
