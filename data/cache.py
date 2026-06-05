@@ -1,93 +1,107 @@
-"""Data Cache — Priority 1.
+"""In-memory LRU cache — Phase 2.
 
-Local Parquet-based cache for OHLCV data.
-Avoids repeated API calls for the same symbol + interval + date range.
+Thin layer sitting in front of ParquetStorage and the network fetcher.
+Eliminates repeated yfinance calls for the same symbol+interval within a session.
 
-Cache location: data/cache/<symbol>_<interval>_<from>_<to>.parquet
+TTL per interval:
+  Intraday (1m-1h)  : 60 seconds  (refresh every minute max)
+  Daily             : 6 hours
+  Weekly / Monthly  : 24 hours
 
 Usage:
+    from data.cache import DataCache
     cache = DataCache()
-    df = cache.read("RELIANCE.NS", "1d", "2024-01-01", "2024-12-31")
+    df = cache.get("RELIANCE.NS", "5m")
     if df is None:
-        df = provider.fetch_ohlcv(...)
-        cache.write(df, "RELIANCE.NS", "1d", "2024-01-01", "2024-12-31")
+        df = fetch_from_source()
+        cache.set("RELIANCE.NS", "5m", df)
+    cache.invalidate("RELIANCE.NS")
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
 
-from core.logger import logger
+from core.logger import get_logger
 
-CACHE_DIR = Path(__file__).parent / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
+log = get_logger("data.cache")
+
+# TTL per interval
+_TTL: dict[str, timedelta] = {
+    "1m":  timedelta(seconds=60),
+    "3m":  timedelta(seconds=60),
+    "5m":  timedelta(seconds=60),
+    "15m": timedelta(seconds=60),
+    "30m": timedelta(seconds=120),
+    "1h":  timedelta(seconds=300),
+    "1d":  timedelta(hours=6),
+    "1wk": timedelta(hours=24),
+    "1mo": timedelta(hours=24),
+}
+
+_DEFAULT_TTL = timedelta(minutes=5)
+_MAX_ENTRIES = 256
 
 
 class DataCache:
-    """File-based OHLCV cache using Parquet format."""
+    """In-memory LRU cache for OHLCV DataFrames with per-interval TTL."""
 
-    def _key(self, symbol: str, interval: str, from_date: str, to_date: str) -> Path:
-        safe = symbol.replace(".", "_").replace("/", "_")
-        filename = f"{safe}_{interval}_{from_date}_{to_date}.parquet"
-        return CACHE_DIR / filename
+    def __init__(self) -> None:
+        # key: (symbol, interval) → (df, expires_at)
+        self._store: dict[tuple, tuple] = {}
 
-    def read(
-        self,
-        symbol: str,
-        interval: str,
-        from_date: str,
-        to_date: str,
-    ) -> Optional[pd.DataFrame]:
-        """Read cached OHLCV data. Returns None if not cached."""
-        path = self._key(symbol, interval, from_date, to_date)
-        if path.exists():
-            logger.debug(f"[cache] HIT — {path.name}")
-            return pd.read_parquet(path)
-        logger.debug(f"[cache] MISS — {path.name}")
-        return None
+    def get(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
+        """Return cached DataFrame or None if missing/expired."""
+        key = (symbol.upper(), interval)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        df, expires_at = entry
+        if datetime.now() > expires_at:
+            del self._store[key]
+            log.debug(f"Cache expired: {symbol}/{interval}")
+            return None
+        return df
 
-    def write(
-        self,
-        df: pd.DataFrame,
-        symbol: str,
-        interval: str,
-        from_date: str,
-        to_date: str,
-    ) -> None:
-        """Write OHLCV DataFrame to cache as Parquet."""
-        if df.empty:
-            logger.warning(f"[cache] Skipping write — empty DataFrame for {symbol}")
+    def set(self, symbol: str, interval: str, df: pd.DataFrame) -> None:
+        """Store DataFrame in cache."""
+        if df is None or df.empty:
             return
-        path = self._key(symbol, interval, from_date, to_date)
-        df.to_parquet(path)
-        logger.info(f"[cache] Saved — {path.name} ({len(df)} rows)")
+        if len(self._store) >= _MAX_ENTRIES:
+            # Evict oldest entry
+            oldest_key = min(self._store, key=lambda k: self._store[k][1])
+            del self._store[oldest_key]
 
-    def invalidate(
-        self,
-        symbol: str,
-        interval: str,
-        from_date: str,
-        to_date: str,
-    ) -> bool:
-        """Delete a specific cache entry. Returns True if deleted."""
-        path = self._key(symbol, interval, from_date, to_date)
-        if path.exists():
-            path.unlink()
-            logger.info(f"[cache] Invalidated — {path.name}")
-            return True
-        return False
+        ttl = _TTL.get(interval, _DEFAULT_TTL)
+        expires_at = datetime.now() + ttl
+        key = (symbol.upper(), interval)
+        self._store[key] = (df.copy(), expires_at)
+        log.debug(f"Cached {len(df)} bars for {symbol}/{interval} (TTL={ttl})")
 
-    def clear_all(self) -> int:
-        """Delete ALL cache files. Returns count of deleted files."""
-        files = list(CACHE_DIR.glob("*.parquet"))
-        for f in files:
-            f.unlink()
-        logger.warning(f"[cache] Cleared {len(files)} cache files")
-        return len(files)
+    def invalidate(self, symbol: str, interval: Optional[str] = None) -> None:
+        """Remove cache entry/entries for a symbol."""
+        sym = symbol.upper()
+        if interval:
+            self._store.pop((sym, interval), None)
+        else:
+            keys_to_del = [k for k in self._store if k[0] == sym]
+            for k in keys_to_del:
+                del self._store[k]
 
-    def list_cached(self) -> list[str]:
-        """List all cached file names."""
-        return [f.name for f in CACHE_DIR.glob("*.parquet")]
+    def clear(self) -> None:
+        """Clear entire cache."""
+        self._store.clear()
+
+    def stats(self) -> dict:
+        """Return cache statistics."""
+        now = datetime.now()
+        live = sum(1 for _, (_, exp) in self._store.items() if now <= exp)
+        return {
+            "total_entries": len(self._store),
+            "live_entries": live,
+            "expired_entries": len(self._store) - live,
+            "max_entries": _MAX_ENTRIES,
+        }
