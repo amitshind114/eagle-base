@@ -1,4 +1,4 @@
-# Eagle-Base Requirements — Phase 4 Complete
+# Eagle-Base Requirements — Phase 1 hardened
 
 # Core
 python-dotenv>=1.0.0
@@ -9,10 +9,16 @@ loguru>=0.7.0
 # Data
 pandas>=2.0.0
 numpy>=1.24.0
-yfinance>=0.2.0
+yfinance>=0.2.40
 requests>=2.31.0
 httpx>=0.24.0
 scipy>=1.11.0
+pandas-ta>=0.3.14b
+pyarrow>=13.0.0
+
+# NSE instrument master sources (tries each in order, uses first that works)
+nsepython>=1.0.0
+# jugaad-trader>=2.5.0  # optional — uncomment if nsepython fails on your env
 
 # API
 fastapi>=0.104.0
