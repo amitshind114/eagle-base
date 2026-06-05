@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import datetime
 import random
+import io
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -47,6 +49,155 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ─── NSE Symbol Master (live from NSE official CSV) ───────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_nse_equity() -> pd.DataFrame:
+    """Pull NSE equity symbol master directly from NSE website."""
+    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [c.strip() for c in df.columns]
+        # NSE CSV columns: SYMBOL, NAME OF COMPANY, SERIES, ...
+        sym_col = "SYMBOL"
+        name_col = " NAME OF COMPANY" if " NAME OF COMPANY" in df.columns else "NAME OF COMPANY"
+        df = df[[sym_col, name_col]].dropna()
+        df.columns = ["SYMBOL", "NAME"]
+        df["SYMBOL"] = df["SYMBOL"].str.strip()
+        df["NAME"] = df["NAME"].str.strip()
+        df["YF_SYMBOL"] = df["SYMBOL"] + ".NS"
+        df["SEGMENT"] = "Equity"
+        df["EXCHANGE"] = "NSE"
+        return df.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["SYMBOL", "NAME", "YF_SYMBOL", "SEGMENT", "EXCHANGE"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_nse_fno() -> pd.DataFrame:
+    """Pull NSE F&O (derivatives) symbol list from NSE."""
+    url = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [c.strip() for c in df.columns]
+        sym_col = next((c for c in df.columns if "SYMBOL" in c.upper()), df.columns[0])
+        df = df[[sym_col]].dropna()
+        df.columns = ["SYMBOL"]
+        df["SYMBOL"] = df["SYMBOL"].str.strip()
+        df = df[~df["SYMBOL"].str.contains("SYMBOL|^$", na=True)]
+        df["NAME"] = df["SYMBOL"]
+        df["YF_SYMBOL"] = df["SYMBOL"] + ".NS"
+        df["SEGMENT"] = "F&O"
+        df["EXCHANGE"] = "NSE"
+        return df.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["SYMBOL", "NAME", "YF_SYMBOL", "SEGMENT", "EXCHANGE"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_indices() -> pd.DataFrame:
+    """NSE & BSE key indices with yfinance symbols."""
+    data = [
+        # NSE Indices
+        ("NIFTY 50",        "^NSEI",      "Index", "NSE"),
+        ("NIFTY BANK",      "^NSEBANK",   "Index", "NSE"),
+        ("NIFTY IT",        "^CNXIT",     "Index", "NSE"),
+        ("NIFTY MIDCAP 100","^CNXMIDCAP", "Index", "NSE"),
+        ("NIFTY SMALLCAP",  "^CNXSC",     "Index", "NSE"),
+        ("NIFTY NEXT 50",   "^NSMIDCP",   "Index", "NSE"),
+        ("NIFTY FIN SERVICE","NIFTY_FIN_SERVICE.NS","Index","NSE"),
+        ("NIFTY AUTO",      "^CNXAUTO",   "Index", "NSE"),
+        ("NIFTY PHARMA",    "^CNXPHARMA", "Index", "NSE"),
+        ("NIFTY FMCG",      "^CNXFMCG",   "Index", "NSE"),
+        ("NIFTY METAL",     "^CNXMETAL",  "Index", "NSE"),
+        ("NIFTY REALTY",    "^CNXREALTY", "Index", "NSE"),
+        ("NIFTY ENERGY",    "^CNXENERGY", "Index", "NSE"),
+        ("NIFTY INFRA",     "^CNXINFRA",  "Index", "NSE"),
+        ("NIFTY MEDIA",     "^CNXMEDIA",  "Index", "NSE"),
+        # BSE Indices
+        ("SENSEX",          "^BSESN",     "Index", "BSE"),
+        ("BSE MIDCAP",      "BSE-MIDCAP.BO","Index","BSE"),
+        ("BSE SMALLCAP",    "BSE-SMLCAP.BO","Index","BSE"),
+        ("BSE 500",         "BSE-500.BO", "Index", "BSE"),
+    ]
+    df = pd.DataFrame(data, columns=["NAME", "YF_SYMBOL", "SEGMENT", "EXCHANGE"])
+    df["SYMBOL"] = df["YF_SYMBOL"]
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_commodities() -> pd.DataFrame:
+    """MCX commodities + global commodities available via yfinance."""
+    data = [
+        # MCX India (via yfinance)
+        ("GOLD",       "GC=F",   "Commodity-MCX", "MCX"),
+        ("SILVER",     "SI=F",   "Commodity-MCX", "MCX"),
+        ("CRUDE OIL",  "CL=F",   "Commodity-MCX", "MCX"),
+        ("NATURAL GAS","NG=F",   "Commodity-MCX", "MCX"),
+        ("COPPER",     "HG=F",   "Commodity-MCX", "MCX"),
+        ("ALUMINIUM",  "ALI=F",  "Commodity-MCX", "MCX"),
+        ("ZINC",       "ZNC=F",  "Commodity-MCX", "MCX"),
+        ("NICKEL",     "NMC=F",  "Commodity-MCX", "MCX"),
+        ("LEAD",       "LE=F",   "Commodity-MCX", "MCX"),
+        ("COTTON",     "CT=F",   "Commodity-Agri","NCDEX"),
+        ("SOYBEAN",    "ZS=F",   "Commodity-Agri","NCDEX"),
+        ("WHEAT",      "ZW=F",   "Commodity-Agri","NCDEX"),
+        ("CORN",       "ZC=F",   "Commodity-Agri","NCDEX"),
+        ("PALM OIL",   "KO=F",   "Commodity-Agri","NCDEX"),
+        ("BRENT CRUDE","BZ=F",   "Commodity-MCX", "MCX"),
+    ]
+    df = pd.DataFrame(data, columns=["NAME", "YF_SYMBOL", "SEGMENT", "EXCHANGE"])
+    df["SYMBOL"] = df["NAME"]
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_currency() -> pd.DataFrame:
+    """Currency pairs relevant to Indian traders."""
+    data = [
+        ("USD/INR",  "USDINR=X",  "Currency", "NSE"),
+        ("EUR/INR",  "EURINR=X",  "Currency", "NSE"),
+        ("GBP/INR",  "GBPINR=X",  "Currency", "NSE"),
+        ("JPY/INR",  "JPYINR=X",  "Currency", "NSE"),
+        ("USD/JPY",  "USDJPY=X",  "Currency", "FOREX"),
+        ("EUR/USD",  "EURUSD=X",  "Currency", "FOREX"),
+        ("GBP/USD",  "GBPUSD=X",  "Currency", "FOREX"),
+        ("DXY",      "DX-Y.NYB",  "Currency", "FOREX"),
+    ]
+    df = pd.DataFrame(data, columns=["NAME", "YF_SYMBOL", "SEGMENT", "EXCHANGE"])
+    df["SYMBOL"] = df["NAME"]
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_full_universe() -> pd.DataFrame:
+    """Combine all segments into one searchable master."""
+    equity = load_nse_equity()
+    fno = load_nse_fno()
+    # merge F&O flag into equity
+    fno_symbols = set(fno["SYMBOL"].tolist())
+    equity["SEGMENT"] = equity["SYMBOL"].apply(
+        lambda s: "Equity+F&O" if s in fno_symbols else "Equity"
+    )
+    indices = load_indices()
+    commodities = load_commodities()
+    currency = load_currency()
+    cols = ["SYMBOL", "NAME", "YF_SYMBOL", "SEGMENT", "EXCHANGE"]
+    all_df = pd.concat([equity[cols], indices[cols], commodities[cols], currency[cols]], ignore_index=True)
+    return all_df.drop_duplicates(subset=["YF_SYMBOL"]).reset_index(drop=True)
+
+
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 def sidebar():
     with st.sidebar:
@@ -54,7 +205,7 @@ def sidebar():
             <span style='font-size:2rem'>🦅</span>
             <div style='font-size:1.2rem; font-weight:700; color:#fff'>Eagle-Base</div>
             <div style='font-size:0.75rem; color:#888'>Algo Research & Trading System</div>
-            <div style='margin-top:6px'><span style='background:#1a3a1a; color:#00c853; border-radius:4px; padding:2px 8px; font-size:0.7rem'>v0.1.0 LIVE</span></div>
+            <div style='margin-top:6px'><span style='background:#1a3a1a; color:#00c853; border-radius:4px; padding:2px 8px; font-size:0.7rem'>v0.2.0 LIVE</span></div>
         </div>""", unsafe_allow_html=True)
         st.divider()
         page = st.radio(
@@ -88,22 +239,32 @@ def home_page():
     col1.metric("Phase", "4 / 4", "✅ Complete")
     col2.metric("Modules", "10", "All Live")
     col3.metric("Status", "Active", "Running")
-    col4.metric("Engine", "yfinance", "Connected")
+    col4.metric("Engine", "yfinance + NSE", "Connected")
 
     st.divider()
     st.subheader("📡 Market Snapshot — Nifty 50 Heatmap")
-    tickers = {
-        "RELIANCE": "RELIANCE.NS", "TCS": "TCS.NS", "HDFCBANK": "HDFCBANK.NS",
-        "INFY": "INFY.NS", "ICICIBANK": "ICICIBANK.NS", "HINDUNILVR": "HINDUNILVR.NS",
-        "ITC": "ITC.NS", "SBIN": "SBIN.NS", "BHARTIARTL": "BHARTIARTL.NS",
-        "KOTAKBANK": "KOTAKBANK.NS",
+    NIFTY50 = {
+        "RELIANCE":"RELIANCE.NS","TCS":"TCS.NS","HDFCBANK":"HDFCBANK.NS",
+        "INFY":"INFY.NS","ICICIBANK":"ICICIBANK.NS","HINDUNILVR":"HINDUNILVR.NS",
+        "ITC":"ITC.NS","SBIN":"SBIN.NS","BHARTIARTL":"BHARTIARTL.NS","KOTAKBANK":"KOTAKBANK.NS",
+        "LT":"LT.NS","WIPRO":"WIPRO.NS","AXISBANK":"AXISBANK.NS","MARUTI":"MARUTI.NS",
+        "TATAMOTORS":"TATAMOTORS.NS","ONGC":"ONGC.NS","SUNPHARMA":"SUNPHARMA.NS",
+        "TITAN":"TITAN.NS","ULTRACEMCO":"ULTRACEMCO.NS","BAJFINANCE":"BAJFINANCE.NS",
+        "NTPC":"NTPC.NS","POWERGRID":"POWERGRID.NS","ADANIENT":"ADANIENT.NS",
+        "ADANIPORTS":"ADANIPORTS.NS","COALINDIA":"COALINDIA.NS","BAJAJFINSV":"BAJAJFINSV.NS",
+        "HCLTECH":"HCLTECH.NS","GRASIM":"GRASIM.NS","NESTLEIND":"NESTLEIND.NS","TECHM":"TECHM.NS",
+        "TATASTEEL":"TATASTEEL.NS","JSWSTEEL":"JSWSTEEL.NS","M&M":"M&M.NS","INDUSINDBK":"INDUSINDBK.NS",
+        "DRREDDY":"DRREDDY.NS","CIPLA":"CIPLA.NS","APOLLOHOSP":"APOLLOHOSP.NS",
+        "BPCL":"BPCL.NS","EICHERMOT":"EICHERMOT.NS","HEROMOTOCO":"HEROMOTOCO.NS",
+        "BRITANNIA":"BRITANNIA.NS","DIVISLAB":"DIVISLAB.NS","TATACONSUM":"TATACONSUM.NS",
+        "UPL":"UPL.NS","SHREECEM":"SHREECEM.NS","SBILIFE":"SBILIFE.NS",
+        "HDFCLIFE":"HDFCLIFE.NS","ICICIGI":"ICICIGI.NS","BAJAJ-AUTO":"BAJAJ-AUTO.NS","HINDALCO":"HINDALCO.NS",
     }
-    with st.spinner("Fetching market data..."):
+    with st.spinner("Fetching Nifty 50 data..."):
         rows = []
-        for name, sym in tickers.items():
+        for name, sym in NIFTY50.items():
             try:
-                t = yf.Ticker(sym)
-                hist = t.history(period="2d")
+                hist = yf.Ticker(sym).history(period="2d")
                 if len(hist) >= 2:
                     chg = (hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100
                     rows.append({"Symbol": name, "Change%": round(chg, 2), "Price": round(hist["Close"].iloc[-1], 2)})
@@ -118,14 +279,31 @@ def home_page():
         custom_data=["Change%", "Price"]
     )
     fig.update_traces(texttemplate="<b>%{label}</b><br>%{customdata[0]:.2f}%")
-    fig.update_layout(height=350, margin=dict(t=0, b=0, l=0, r=0), paper_bgcolor="rgba(0,0,0,0)", font_color="#fff")
+    fig.update_layout(height=400, margin=dict(t=0, b=0, l=0, r=0), paper_bgcolor="rgba(0,0,0,0)", font_color="#fff")
     st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    # Key indices bar
+    st.subheader("📊 Key Indices")
+    idx_syms = {"NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "SENSEX": "^BSESN",
+                "NIFTY IT": "^CNXIT", "NIFTY MIDCAP": "^CNXMIDCAP",
+                "GOLD": "GC=F", "CRUDE OIL": "CL=F", "USD/INR": "USDINR=X"}
+    idx_cols = st.columns(len(idx_syms))
+    for col, (name, sym) in zip(idx_cols, idx_syms.items()):
+        try:
+            hist = yf.Ticker(sym).history(period="2d")
+            if len(hist) >= 2:
+                ltp = hist["Close"].iloc[-1]
+                chg = (ltp - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100
+                col.metric(name, f"{ltp:,.2f}", f"{chg:+.2f}%")
+        except Exception:
+            col.metric(name, "N/A")
 
     st.divider()
     st.subheader("🗂️ Module Status")
     modules = [
-        ("📊", "Data", "✅ Live", "yfinance OHLCV, multi-timeframe"),
-        ("🔍", "Instruments", "✅ Live", "NSE/BSE search, sector filter"),
+        ("📊", "Data", "✅ Live", "NSE live OHLCV, all segments"),
+        ("🔍", "Instruments", "✅ Live", "NSE master — 1800+ symbols, F&O, Index, Commodity"),
         ("⚙️", "Backtesting", "✅ Live", "SMA/EMA/RSI/MACD strategies"),
         ("🧩", "Strategies", "✅ Live", "Plugin manager, param editor"),
         ("📈", "Reporting", "✅ Live", "PnL, drawdown, trade log"),
@@ -151,35 +329,99 @@ def home_page():
 # ─── DATA MODULE ──────────────────────────────────────────────────────────────
 def data_page():
     st.title("📊 Data Module")
-    st.caption("Live OHLCV data from yfinance — NSE/BSE instruments")
+    st.caption("Live OHLCV data — NSE Equity, F&O, Indices, Commodities, Currency")
     st.divider()
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        symbol = st.text_input("Symbol (NSE)", value="RELIANCE.NS").upper()
-    with col2:
-        period = st.selectbox("Period", ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y"], index=4)
-    with col3:
-        interval = st.selectbox("Interval", ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"], index=5)
+    universe = get_full_universe()
 
-    if st.button("🔄 Fetch Data", type="primary"):
-        with st.spinner(f"Fetching {symbol}..."):
+    tab_manual, tab_search = st.tabs(["🔡 Enter Symbol Manually", "🔍 Search from Universe"])
+
+    with tab_manual:
+        st.caption("Type any yfinance-compatible symbol. e.g. RELIANCE.NS · ^NSEI · GC=F · USDINR=X")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            symbol = st.text_input("Symbol", value="RELIANCE.NS", key="data_manual").strip().upper()
+        with col2:
+            period = st.selectbox("Period", ["1d","5d","1mo","3mo","6mo","1y","2y","5y"], index=4, key="data_period_m")
+        with col3:
+            interval = st.selectbox("Interval", ["1m","5m","15m","30m","1h","1d","1wk","1mo"], index=5, key="data_interval_m")
+        fetch_sym = symbol
+
+    with tab_search:
+        segments = ["All"] + sorted(universe["SEGMENT"].unique().tolist())
+        exchanges = ["All"] + sorted(universe["EXCHANGE"].dropna().unique().tolist())
+        c1, c2, c3 = st.columns([3, 1, 1])
+        query = c1.text_input("🔍 Search by name or symbol", placeholder="e.g. TATA, NIFTY, GOLD, CRUDE...", key="data_search")
+        seg_f = c2.selectbox("Segment", segments, key="data_seg")
+        exc_f = c3.selectbox("Exchange", exchanges, key="data_exc")
+
+        filtered = universe.copy()
+        if query:
+            q = query.upper()
+            filtered = filtered[
+                filtered["SYMBOL"].str.upper().str.contains(q, na=False) |
+                filtered["NAME"].str.upper().str.contains(q, na=False)
+            ]
+        if seg_f != "All":
+            filtered = filtered[filtered["SEGMENT"] == seg_f]
+        if exc_f != "All":
+            filtered = filtered[filtered["EXCHANGE"] == exc_f]
+
+        st.caption(f"Showing {len(filtered):,} results from {len(universe):,} total symbols")
+        st.dataframe(filtered[["SYMBOL","NAME","SEGMENT","EXCHANGE","YF_SYMBOL"]].head(200),
+                     use_container_width=True, hide_index=True, height=200)
+
+        col2a, col2b, col2c = st.columns(3)
+        selected_yf = col2a.text_input("Selected YF Symbol (copy from above)", value="", key="data_search_sym",
+                                       placeholder="e.g. RELIANCE.NS")
+        period2 = col2b.selectbox("Period", ["1d","5d","1mo","3mo","6mo","1y","2y","5y"], index=4, key="data_period_s")
+        interval2 = col2c.selectbox("Interval", ["1m","5m","15m","30m","1h","1d","1wk","1mo"], index=5, key="data_interval_s")
+        fetch_sym = selected_yf.strip().upper() if selected_yf.strip() else None
+        period = period2
+        interval = interval2
+
+    st.divider()
+    if st.button("🔄 Fetch Data", type="primary", key="fetch_data_btn"):
+        if not fetch_sym:
+            st.warning("Please enter or select a symbol.")
+            return
+        with st.spinner(f"Fetching {fetch_sym}..."):
             try:
-                ticker = yf.Ticker(symbol)
+                ticker = yf.Ticker(fetch_sym)
                 df = ticker.history(period=period, interval=interval)
                 if df.empty:
-                    st.error("No data returned. Check symbol or interval combination.")
+                    st.error(f"No data returned for **{fetch_sym}**. Check symbol or period/interval combination.")
+                    st.info("Tip: Intraday intervals (1m,5m) only work with period ≤ 7d. Use 1d interval for longer periods.")
                     return
                 df.index = pd.to_datetime(df.index)
-                df = df[["Open", "High", "Low", "Close", "Volume"]].round(2)
+                df = df[["Open","High","Low","Close","Volume"]].round(4)
 
-                info = ticker.info
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Last Close", f"₹{df['Close'].iloc[-1]:.2f}")
-                chg = df['Close'].iloc[-1] - df['Close'].iloc[-2] if len(df) > 1 else 0
-                m2.metric("Change", f"₹{chg:.2f}", f"{chg/df['Close'].iloc[-2]*100:.2f}%" if len(df) > 1 else "")
-                m3.metric("52W High", f"₹{df['High'].max():.2f}")
-                m4.metric("52W Low", f"₹{df['Low'].min():.2f}")
+                # Pull info for extra context
+                try:
+                    info = ticker.info
+                    long_name = info.get("longName", fetch_sym)
+                    currency_sym = info.get("currency", "")
+                    sector = info.get("sector", "")
+                    mkt_cap = info.get("marketCap", 0)
+                except Exception:
+                    long_name, currency_sym, sector, mkt_cap = fetch_sym, "", "", 0
+
+                st.subheader(f"📈 {long_name}")
+                if sector:
+                    st.caption(f"Sector: {sector} | Currency: {currency_sym}")
+                if mkt_cap:
+                    st.caption(f"Market Cap: ₹{mkt_cap/1e7:,.0f} Cr")
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                ltp = df["Close"].iloc[-1]
+                m1.metric("LTP", f"{ltp:,.2f}")
+                if len(df) > 1:
+                    chg = ltp - df["Close"].iloc[-2]
+                    chg_pct = chg / df["Close"].iloc[-2] * 100
+                    m2.metric("Change", f"{chg:+,.2f}", f"{chg_pct:+.2f}%")
+                m3.metric("Period High", f"{df['High'].max():,.2f}")
+                m4.metric("Period Low", f"{df['Low'].min():,.2f}")
+                m5.metric("Avg Volume", f"{df['Volume'].mean():,.0f}")
 
                 st.subheader("📈 Candlestick Chart")
                 fig = go.Figure(data=[
@@ -197,87 +439,137 @@ def data_page():
                 st.plotly_chart(fig, use_container_width=True)
 
                 st.subheader("📊 Volume")
-                fig_vol = px.bar(df, x=df.index, y="Volume", color_discrete_sequence=["#1976d2"])
-                fig_vol.update_layout(height=200, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#ccc")
+                colors = ["#00c853" if c >= o else "#ff5252" for o, c in zip(df["Open"], df["Close"])]
+                fig_vol = go.Figure(go.Bar(x=df.index, y=df["Volume"], marker_color=colors))
+                fig_vol.update_layout(height=200, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#ccc",
+                                      xaxis=dict(gridcolor="#1e1e1e"), yaxis=dict(gridcolor="#1e1e1e"))
                 st.plotly_chart(fig_vol, use_container_width=True)
 
                 st.subheader("📋 Raw OHLCV Data")
                 st.dataframe(df.sort_index(ascending=False), use_container_width=True, height=300)
-
                 csv = df.to_csv()
-                st.download_button("⬇️ Download CSV", csv, f"{symbol}_{period}.csv", "text/csv")
+                st.download_button("⬇️ Download CSV", csv, f"{fetch_sym}_{period}.csv", "text/csv")
 
             except Exception as e:
-                st.error(f"Error: {e}")
-    else:
-        st.info("Enter a symbol and click Fetch Data. Example: RELIANCE.NS, TCS.NS, NIFTY50=NSE")
+                st.error(f"Error fetching data: {e}")
 
 
 # ─── INSTRUMENTS ──────────────────────────────────────────────────────────────
 def instruments_page():
-    st.title("🔍 Instruments")
-    st.caption("Search and analyse NSE/BSE instruments")
+    st.title("🔍 Instruments — Full Universe")
+    st.caption("Live from NSE: Equity · F&O · Indices · Commodities · Currency — 1800+ symbols")
     st.divider()
 
-    INSTRUMENTS = {
-        "RELIANCE.NS": {"name": "Reliance Industries", "sector": "Energy", "market": "NSE"},
-        "TCS.NS": {"name": "Tata Consultancy Services", "sector": "IT", "market": "NSE"},
-        "HDFCBANK.NS": {"name": "HDFC Bank", "sector": "Banking", "market": "NSE"},
-        "INFY.NS": {"name": "Infosys", "sector": "IT", "market": "NSE"},
-        "ICICIBANK.NS": {"name": "ICICI Bank", "sector": "Banking", "market": "NSE"},
-        "ITC.NS": {"name": "ITC Ltd", "sector": "FMCG", "market": "NSE"},
-        "SBIN.NS": {"name": "State Bank of India", "sector": "Banking", "market": "NSE"},
-        "HINDUNILVR.NS": {"name": "Hindustan Unilever", "sector": "FMCG", "market": "NSE"},
-        "BHARTIARTL.NS": {"name": "Bharti Airtel", "sector": "Telecom", "market": "NSE"},
-        "KOTAKBANK.NS": {"name": "Kotak Mahindra Bank", "sector": "Banking", "market": "NSE"},
-        "LT.NS": {"name": "Larsen & Toubro", "sector": "Infrastructure", "market": "NSE"},
-        "WIPRO.NS": {"name": "Wipro", "sector": "IT", "market": "NSE"},
-        "AXISBANK.NS": {"name": "Axis Bank", "sector": "Banking", "market": "NSE"},
-        "MARUTI.NS": {"name": "Maruti Suzuki", "sector": "Auto", "market": "NSE"},
-        "TATAMOTORS.NS": {"name": "Tata Motors", "sector": "Auto", "market": "NSE"},
-        "ONGC.NS": {"name": "ONGC", "sector": "Energy", "market": "NSE"},
-        "SUNPHARMA.NS": {"name": "Sun Pharma", "sector": "Pharma", "market": "NSE"},
-        "TITAN.NS": {"name": "Titan Company", "sector": "Consumer", "market": "NSE"},
-        "ULTRACEMCO.NS": {"name": "UltraTech Cement", "sector": "Cement", "market": "NSE"},
-        "BAJFINANCE.NS": {"name": "Bajaj Finance", "sector": "NBFC", "market": "NSE"},
-    }
+    with st.spinner("Loading NSE symbol master..."):
+        universe = get_full_universe()
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        search = st.text_input("🔍 Search symbol or name", placeholder="e.g. RELIANCE or Banking")
-    with col2:
-        sector_filter = st.selectbox("Sector", ["All"] + sorted(set(v["sector"] for v in INSTRUMENTS.values())))
+    total = len(universe)
+    seg_counts = universe["SEGMENT"].value_counts()
 
-    df_inst = pd.DataFrame([
-        {"Symbol": k, "Name": v["name"], "Sector": v["sector"], "Market": v["market"]}
-        for k, v in INSTRUMENTS.items()
-    ])
-    if search:
-        df_inst = df_inst[df_inst.apply(lambda r: search.upper() in r["Symbol"] or search.lower() in r["Name"].lower(), axis=1)]
-    if sector_filter != "All":
-        df_inst = df_inst[df_inst["Sector"] == sector_filter]
-
-    st.dataframe(df_inst, use_container_width=True, hide_index=True)
+    # Summary metrics
+    m_cols = st.columns(6)
+    m_cols[0].metric("Total Symbols", f"{total:,}")
+    m_cols[1].metric("Equity", f"{seg_counts.get('Equity', 0) + seg_counts.get('Equity+F&O', 0):,}")
+    m_cols[2].metric("F&O Eligible", f"{seg_counts.get('Equity+F&O', 0):,}")
+    m_cols[3].metric("Indices", f"{seg_counts.get('Index', 0):,}")
+    m_cols[4].metric("Commodities", f"{seg_counts.get('Commodity-MCX', 0) + seg_counts.get('Commodity-Agri', 0):,}")
+    m_cols[5].metric("Currency", f"{seg_counts.get('Currency', 0):,}")
 
     st.divider()
-    st.subheader("📊 Live Comparison")
-    selected = st.multiselect("Select symbols to compare", list(INSTRUMENTS.keys()), default=["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"])
-    if selected and st.button("📈 Compare", type="primary"):
-        with st.spinner("Fetching comparison data..."):
-            dfs = {}
-            for sym in selected:
+
+    # ── Search ──
+    st.subheader("🔍 Search & Filter")
+    c1, c2, c3 = st.columns([3, 1, 1])
+    query = c1.text_input("Search symbol or company name", placeholder="e.g. TATA, HDFC, NIFTY, GOLD, CRUDE, USD")
+    segments = ["All"] + sorted(universe["SEGMENT"].unique().tolist())
+    exchanges = ["All"] + sorted(universe["EXCHANGE"].dropna().unique().tolist())
+    seg_f = c2.selectbox("Segment", segments, key="inst_seg")
+    exc_f = c3.selectbox("Exchange", exchanges, key="inst_exc")
+
+    filtered = universe.copy()
+    if query:
+        q = query.upper()
+        filtered = filtered[
+            filtered["SYMBOL"].str.upper().str.contains(q, na=False) |
+            filtered["NAME"].str.upper().str.contains(q, na=False)
+        ]
+    if seg_f != "All":
+        filtered = filtered[filtered["SEGMENT"] == seg_f]
+    if exc_f != "All":
+        filtered = filtered[filtered["EXCHANGE"] == exc_f]
+
+    st.caption(f"**{len(filtered):,}** results matched")
+    st.dataframe(
+        filtered[["SYMBOL", "NAME", "SEGMENT", "EXCHANGE", "YF_SYMBOL"]].head(500),
+        use_container_width=True, hide_index=True, height=350
+    )
+    csv_all = filtered.to_csv(index=False)
+    st.download_button("⬇️ Export Filtered List", csv_all, "instruments.csv", "text/csv")
+
+    st.divider()
+
+    # ── Live Quote for any searched symbol ──
+    st.subheader("⚡ Live Quote — Any Symbol")
+    st.caption("Select any symbol from above and fetch live data instantly")
+    q_col1, q_col2 = st.columns([2, 1])
+    yf_sym = q_col1.text_input("YF Symbol (e.g. RELIANCE.NS · ^NSEI · GC=F · USDINR=X)",
+                                placeholder="Paste YF_SYMBOL from table above")
+    if q_col2.button("📡 Get Live Quote", type="primary") and yf_sym:
+        with st.spinner(f"Fetching {yf_sym.strip().upper()}..."):
+            try:
+                t = yf.Ticker(yf_sym.strip().upper())
+                hist = t.history(period="5d")
+                info = {}
                 try:
-                    t = yf.Ticker(sym)
-                    hist = t.history(period="6mo")["Close"]
-                    dfs[sym.replace(".NS", "")] = hist
+                    info = t.info
                 except Exception:
                     pass
-            if dfs:
-                df_comp = pd.DataFrame(dfs)
-                df_norm = df_comp / df_comp.iloc[0] * 100
-                fig = px.line(df_norm, title="Normalised Price (Base=100)", color_discrete_sequence=px.colors.qualitative.Set2)
-                fig.update_layout(height=400, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#ccc")
-                st.plotly_chart(fig, use_container_width=True)
+                if not hist.empty:
+                    ltp = hist["Close"].iloc[-1]
+                    prev = hist["Close"].iloc[-2] if len(hist) > 1 else ltp
+                    chg = ltp - prev
+                    chg_pct = chg / prev * 100 if prev else 0
+                    qa, qb, qc, qd = st.columns(4)
+                    qa.metric("LTP", f"{ltp:,.4f}", f"{chg_pct:+.2f}%")
+                    qb.metric("5D High", f"{hist['High'].max():,.4f}")
+                    qc.metric("5D Low", f"{hist['Low'].min():,.4f}")
+                    qd.metric("Volume", f"{hist['Volume'].iloc[-1]:,.0f}")
+                    if info.get("longName"):
+                        st.info(f"**{info['longName']}** | Sector: {info.get('sector','—')} | Market: {info.get('exchange','—')}")
+                else:
+                    st.error("No data returned. Symbol may be invalid or market closed.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    st.divider()
+
+    # ── Compare any symbols ──
+    st.subheader("📊 Compare Any Symbols")
+    comp_input = st.text_input("Enter YF symbols separated by comma",
+                               value="RELIANCE.NS, TCS.NS, HDFCBANK.NS",
+                               placeholder="RELIANCE.NS, ^NSEI, GC=F, USDINR=X")
+    comp_period = st.selectbox("Compare Period", ["1mo","3mo","6mo","1y","2y","5y"], index=2)
+    if st.button("📈 Compare", type="primary"):
+        syms = [s.strip().upper() for s in comp_input.split(",") if s.strip()]
+        with st.spinner("Fetching comparison data..."):
+            dfs = {}
+            for sym in syms:
+                try:
+                    hist = yf.Ticker(sym).history(period=comp_period)["Close"]
+                    if not hist.empty:
+                        dfs[sym] = hist
+                except Exception:
+                    pass
+        if dfs:
+            df_comp = pd.DataFrame(dfs)
+            df_norm = df_comp / df_comp.iloc[0] * 100
+            fig = px.line(df_norm, title="Normalised Price (Base=100)",
+                          color_discrete_sequence=px.colors.qualitative.Set2)
+            fig.update_layout(height=400, paper_bgcolor="rgba(0,0,0,0)",
+                              plot_bgcolor="rgba(0,0,0,0)", font_color="#ccc")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.error("Could not fetch data for the given symbols.")
 
 
 # ─── BACKTESTING ──────────────────────────────────────────────────────────────
@@ -288,7 +580,7 @@ def backtesting_page():
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        bt_symbol = st.text_input("Symbol", value="RELIANCE.NS")
+        bt_symbol = st.text_input("Symbol (any YF symbol)", value="RELIANCE.NS")
     with col2:
         bt_period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=1)
     with col3:
@@ -592,7 +884,7 @@ def paper_page():
     with col1:
         st.subheader("📤 Place Order")
         with st.form("order_form"):
-            o_sym = st.text_input("Symbol", value="RELIANCE.NS")
+            o_sym = st.text_input("Symbol (any YF symbol)", value="RELIANCE.NS")
             o_side = st.radio("Side", ["BUY", "SELL"], horizontal=True)
             o_qty = st.number_input("Quantity", value=10, min_value=1)
             o_type = st.selectbox("Order Type", ["MARKET", "LIMIT"])
@@ -610,7 +902,7 @@ def paper_page():
                             st.error("Insufficient cash")
                         else:
                             port["cash"] -= cost
-                            sym_key = o_sym.replace(".NS", "")
+                            sym_key = o_sym.upper()
                             if sym_key not in port["positions"]:
                                 port["positions"][sym_key] = {"qty": 0, "avg": 0}
                             old_qty = port["positions"][sym_key]["qty"]
@@ -621,7 +913,7 @@ def paper_page():
                             port["orders"].append({"Time": datetime.datetime.now().strftime("%H:%M:%S"), "Symbol": sym_key, "Side": "BUY", "Qty": o_qty, "Price": round(exec_price, 2), "Status": "FILLED"})
                             st.success(f"✅ BUY {o_qty} {o_sym} @ ₹{exec_price:.2f}")
                     else:
-                        sym_key = o_sym.replace(".NS", "")
+                        sym_key = o_sym.upper()
                         if sym_key not in port["positions"] or port["positions"][sym_key]["qty"] < o_qty:
                             st.error("Insufficient position to sell")
                         else:
@@ -643,7 +935,7 @@ def paper_page():
         for sym, pos in port["positions"].items():
             if pos["qty"] > 0:
                 try:
-                    ltp = yf.Ticker(f"{sym}.NS").history(period="1d")["Close"].iloc[-1]
+                    ltp = yf.Ticker(sym).history(period="1d")["Close"].iloc[-1]
                     mkt_val = ltp * pos["qty"]
                     pnl = (ltp - pos["avg"]) * pos["qty"]
                     total_mkt += mkt_val
@@ -674,24 +966,40 @@ def paper_page():
 # ─── AI ANALYZER ──────────────────────────────────────────────────────────────
 def ai_page():
     st.title("🤖 AI Signal Analyzer")
-    st.caption("Automated signal scanning — RSI, MACD, Bollinger, Volume alerts")
+    st.caption("Automated signal scanning — RSI, MACD, Bollinger, Volume alerts — any symbols")
     st.divider()
 
-    WATCHLIST = ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-                 "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS", "WIPRO.NS"]
+    universe = get_full_universe()
+    fno_syms = universe[universe["SEGMENT"] == "Equity+F&O"]["YF_SYMBOL"].tolist()[:50]
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        selected_syms = st.multiselect("Symbols to Scan", WATCHLIST, default=WATCHLIST[:5])
+        scan_input = st.text_input(
+            "Symbols to scan (comma separated YF symbols)",
+            value="RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS, ICICIBANK.NS",
+            help="Enter any valid yfinance symbols"
+        )
     with col2:
         scan_period = st.selectbox("Data Period", ["1mo", "3mo", "6mo"], index=1)
 
+    st.caption("💡 Quick load:")
+    qc1, qc2, qc3 = st.columns(3)
+    if qc1.button("Load Nifty 50 F&O"):
+        scan_input = ", ".join(fno_syms[:20])
+    if qc2.button("Load Indices"):
+        scan_input = "^NSEI, ^NSEBANK, ^CNXIT, ^CNXMIDCAP, ^BSESN"
+    if qc3.button("Load Commodities"):
+        scan_input = "GC=F, SI=F, CL=F, NG=F, HG=F"
+
     if st.button("🔍 Run AI Scan", type="primary"):
-        with st.spinner("Scanning signals across all selected symbols..."):
+        selected_syms = [s.strip().upper() for s in scan_input.split(",") if s.strip()]
+        with st.spinner(f"Scanning {len(selected_syms)} symbols..."):
             signals = []
             for sym in selected_syms:
                 try:
                     df = yf.Ticker(sym).history(period=scan_period)
+                    if df.empty or len(df) < 30:
+                        continue
                     close = df["Close"]
                     vol = df["Volume"]
 
@@ -717,32 +1025,23 @@ def ai_page():
                     sig_list = []
                     score = 0
                     if rsi < 35:
-                        sig_list.append("RSI Oversold")
-                        score += 2
+                        sig_list.append("RSI Oversold"); score += 2
                     elif rsi > 65:
-                        sig_list.append("RSI Overbought")
-                        score -= 2
+                        sig_list.append("RSI Overbought"); score -= 2
                     if ema20.iloc[-1] > ema50.iloc[-1] and ema20.iloc[-2] <= ema50.iloc[-2]:
-                        sig_list.append("EMA Bullish Cross")
-                        score += 3
+                        sig_list.append("EMA Bullish Cross"); score += 3
                     elif ema20.iloc[-1] < ema50.iloc[-1] and ema20.iloc[-2] >= ema50.iloc[-2]:
-                        sig_list.append("EMA Bearish Cross")
-                        score -= 3
+                        sig_list.append("EMA Bearish Cross"); score -= 3
                     if macd > sig_macd:
-                        sig_list.append("MACD Bullish")
-                        score += 1
+                        sig_list.append("MACD Bullish"); score += 1
                     else:
-                        sig_list.append("MACD Bearish")
-                        score -= 1
+                        sig_list.append("MACD Bearish"); score -= 1
                     if current_close < bb_lower:
-                        sig_list.append("Below BB Lower")
-                        score += 2
+                        sig_list.append("Below BB Lower"); score += 2
                     elif current_close > bb_upper:
-                        sig_list.append("Above BB Upper")
-                        score -= 2
-                    if curr_vol > avg_vol * 1.5:
-                        sig_list.append("High Volume Spike")
-                        score += 1
+                        sig_list.append("Above BB Upper"); score -= 2
+                    if avg_vol > 0 and curr_vol > avg_vol * 1.5:
+                        sig_list.append("High Volume Spike"); score += 1
 
                     recommendation = "🟢 STRONG BUY" if score >= 4 else \
                                      "🟩 BUY" if score >= 2 else \
@@ -750,7 +1049,7 @@ def ai_page():
                                      "🟥 SELL" if score <= -2 else "⚪ NEUTRAL"
 
                     signals.append({
-                        "Symbol": sym.replace(".NS", ""),
+                        "Symbol": sym,
                         "LTP": round(current_close, 2),
                         "RSI": round(rsi, 1),
                         "Score": score,
@@ -758,7 +1057,7 @@ def ai_page():
                         "Recommendation": recommendation
                     })
                 except Exception as e:
-                    signals.append({"Symbol": sym.replace(".NS", ""), "LTP": 0, "RSI": 0, "Score": 0, "Signals": f"Error: {e}", "Recommendation": "❓"})
+                    signals.append({"Symbol": sym, "LTP": 0, "RSI": 0, "Score": 0, "Signals": f"Error: {e}", "Recommendation": "❓"})
 
             df_sig = pd.DataFrame(signals).sort_values("Score", ascending=False)
 
@@ -782,38 +1081,55 @@ def ai_page():
                 fig2.update_layout(height=350, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#ccc")
                 st.plotly_chart(fig2, use_container_width=True)
     else:
-        st.info("Select symbols and click Run AI Scan to analyse signals.")
+        st.info("Enter symbols and click Run AI Scan to analyse signals.")
 
 
 # ─── DERIVATIVES ──────────────────────────────────────────────────────────────
 def derivatives_page():
     st.title("📐 Derivatives — Options Chain")
-    st.caption("Options chain viewer with Greeks estimation")
+    st.caption("Options chain viewer with Black-Scholes Greeks — live spot price fetched from yfinance")
     st.divider()
+
+    universe = get_full_universe()
+    fno_list = universe[universe["SEGMENT"] == "Equity+F&O"]["SYMBOL"].tolist()
+    index_list = ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "SENSEX"]
+    all_underlyings = index_list + sorted(fno_list)
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        der_sym = st.selectbox("Underlying", ["NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY"])
+        der_sym = st.selectbox("Underlying", all_underlyings)
     with col2:
         expiry_opts = [(datetime.date.today() + datetime.timedelta(days=d)).strftime("%d-%b-%Y")
                        for d in [7, 14, 21, 30, 45, 60]]
         expiry = st.selectbox("Expiry", expiry_opts)
     with col3:
-        spot_map = {"NIFTY": 24350, "BANKNIFTY": 52100, "RELIANCE": 2920, "TCS": 4250, "INFY": 1720}
-        spot = st.number_input("Spot Price", value=float(spot_map[der_sym]))
+        # Fetch live spot price
+        yf_map = {
+            "NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "MIDCPNIFTY": "^CNXMIDCAP",
+            "FINNIFTY": "NIFTY_FIN_SERVICE.NS", "SENSEX": "^BSESN"
+        }
+        yf_sym_der = yf_map.get(der_sym, f"{der_sym}.NS")
+        try:
+            live_spot = yf.Ticker(yf_sym_der).history(period="1d")["Close"].iloc[-1]
+        except Exception:
+            live_spot = 24000.0
+        spot = st.number_input("Spot Price (auto-fetched)", value=float(round(live_spot, 2)))
+
+    iv_input = st.slider("Implied Volatility % (IV)", min_value=5, max_value=100, value=18, step=1)
+    sigma = iv_input / 100.0
 
     if st.button("📊 Load Options Chain", type="primary"):
         days_to_exp = max(1, (datetime.datetime.strptime(expiry, "%d-%b-%Y").date() - datetime.date.today()).days)
         T = days_to_exp / 365
         r = 0.065
-        sigma = 0.18
 
         from math import log, sqrt, exp
         from scipy.stats import norm
 
         def black_scholes(S, K, T, r, sigma, option="call"):
             if T <= 0:
-                return max(S - K, 0) if option == "call" else max(K - S, 0)
+                return {"price": max(S - K, 0) if option == "call" else max(K - S, 0),
+                        "delta": 1.0 if option == "call" else -1.0, "gamma": 0, "theta": 0, "vega": 0}
             d1 = (log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
             d2 = d1 - sigma * sqrt(T)
             if option == "call":
@@ -823,11 +1139,12 @@ def derivatives_page():
                 price = K * exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
                 delta = norm.cdf(d1) - 1
             gamma = norm.pdf(d1) / (S * sigma * sqrt(T))
-            theta = (-(S * norm.pdf(d1) * sigma) / (2 * sqrt(T)) - r * K * exp(-r * T) * norm.cdf(d2 if option=="call" else -d2)) / 365
+            theta = (-(S * norm.pdf(d1) * sigma) / (2 * sqrt(T)) - r * K * exp(-r * T) * norm.cdf(d2 if option == "call" else -d2)) / 365
             vega = S * norm.pdf(d1) * sqrt(T) / 100
-            return {"price": round(price, 2), "delta": round(delta, 4), "gamma": round(gamma, 6), "theta": round(theta, 2), "vega": round(vega, 4)}
+            return {"price": round(price, 2), "delta": round(delta, 4), "gamma": round(gamma, 6),
+                    "theta": round(theta, 2), "vega": round(vega, 4)}
 
-        step = 50 if der_sym in ["NIFTY", "BANKNIFTY"] else 20
+        step = 50 if der_sym in ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "SENSEX"] else 20
         atm = round(spot / step) * step
         strikes = [atm + (i - 5) * step for i in range(11)]
 
@@ -837,16 +1154,11 @@ def derivatives_page():
             put = black_scholes(spot, K, T, r, sigma, "put")
             atm_flag = "🎯 ATM" if K == atm else ("ITM" if K < atm else "OTM")
             rows.append({
-                "CALL LTP": call["price"],
-                "CALL Δ": call["delta"],
-                "CALL Θ": call["theta"],
-                "CALL IV%": f"{sigma*100:.1f}",
-                "Strike": K,
-                "Type": atm_flag,
-                "PUT IV%": f"{sigma*100:.1f}",
-                "PUT Θ": put["theta"],
-                "PUT Δ": put["delta"],
-                "PUT LTP": put["price"],
+                "CALL LTP": call["price"], "CALL Δ": call["delta"],
+                "CALL Θ": call["theta"], "CALL IV%": f"{iv_input}",
+                "Strike": K, "Type": atm_flag,
+                "PUT IV%": f"{iv_input}", "PUT Θ": put["theta"],
+                "PUT Δ": put["delta"], "PUT LTP": put["price"],
             })
         df_chain = pd.DataFrame(rows)
         st.dataframe(df_chain, use_container_width=True, hide_index=True, height=420)
@@ -854,11 +1166,9 @@ def derivatives_page():
         st.divider()
         col_a, col_b = st.columns(2)
         with col_a:
-            call_prices = [r["CALL LTP"] for r in rows]
-            put_prices = [r["PUT LTP"] for r in rows]
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=strikes, y=call_prices, name="Call", line=dict(color="#00c853")))
-            fig.add_trace(go.Scatter(x=strikes, y=put_prices, name="Put", line=dict(color="#ff5252")))
+            fig.add_trace(go.Scatter(x=strikes, y=[r["CALL LTP"] for r in rows], name="Call", line=dict(color="#00c853")))
+            fig.add_trace(go.Scatter(x=strikes, y=[r["PUT LTP"] for r in rows], name="Put", line=dict(color="#ff5252")))
             fig.add_vline(x=spot, line_dash="dot", annotation_text="Spot", line_color="#ffd600")
             fig.update_layout(title="Option Premium vs Strike", height=350,
                               paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#ccc")
@@ -885,7 +1195,7 @@ def derivatives_page():
                                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#ccc")
             st.plotly_chart(fig2, use_container_width=True)
     else:
-        st.info("Select underlying, expiry and click Load Options Chain.")
+        st.info("Select underlying and expiry, then click Load Options Chain.")
 
 
 # ─── LIVE ─────────────────────────────────────────────────────────────────────
