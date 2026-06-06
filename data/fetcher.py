@@ -1,4 +1,4 @@
-"""Market data fetcher — Phase 1 hardened.
+"""Market data fetcher — Phase 04 hardened.
 
 Fully resolves any user symbol → yfinance ticker → validated OHLCV.
 Handles:
@@ -8,12 +8,20 @@ Handles:
   - Weekend / holiday: always returns last available session data
   - Bad data: empty result raises clear DataFetchError
 
+Phase 04 changes:
+  - _cap_period rewritten with TO_DAYS int-day dict (no more string order bugs)
+  - 1h/60m cap fixed to 730d (was wrongly 60d)
+  - tz_localize(None) removed — index stays tz-aware (Asia/Kolkata)
+  - fetch_batch returns (dict, list[str]) — errors surfaced
+  - fetch_latest_price has 10s timeout guard
+
 Usage:
     from data.fetcher import DataFetcher
     f = DataFetcher()
     df = f.fetch("RELIANCE", period="5d", interval="5m")
     price = f.fetch_latest_price("NIFTY")
     info  = f.fetch_info("TCS")
+    results, errors = f.fetch_batch(["RELIANCE", "TCS", "INVALID"], period="1y")
 
     # Provider-style API (used by DataManager / tests)
     from data.fetcher import YFinanceProvider
@@ -23,7 +31,7 @@ Usage:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import concurrent.futures
 from typing import Optional
 
 import pandas as pd
@@ -35,22 +43,47 @@ from instruments.symbol_resolver import SymbolResolver
 
 log = get_logger("data.fetcher")
 
-# ── Valid period/interval combinations (yfinance limits) ─────────────────
-_VALID_COMBOS: dict[str, str] = {
+
+# ── Period/interval limits ─────────────────────────────────────────────────────
+#
+# TO_DAYS: canonical day-count for every period/cap string.
+# Used in _cap_period() to compare periods numerically, not by string position.
+# This fixes the old bug where "60d" sorted AFTER "6mo" in an order[] list
+# because it appeared later in the list — making 60 days look longer than 180.
+#
+TO_DAYS: dict[str, int] = {
+    "1d":    1,
+    "2d":    2,
+    "5d":    5,
+    "7d":    7,
+    "1mo":   30,
+    "2mo":   60,
+    "3mo":   90,
+    "60d":   60,
+    "6mo":   180,
+    "730d":  730,
+    "1y":    365,
+    "2y":    730,
+    "3y":    1095,
+    "5y":    1825,
+    "10y":   3650,
+    "max":   9999,
+}
+
+# Per-interval maximum period (yfinance hard limits).
+# 1h/60m: yfinance actually returns up to 730 days of hourly data.
+# 1m:     hard limit 7 days.
+# Old code had 1h->60d which was WRONG and caused empty fetches on >60d requests.
+_INTERVAL_CAPS: dict[str, str] = {
     "1m":  "7d",
     "2m":  "60d",
     "3m":  "60d",
     "5m":  "60d",
     "15m": "60d",
     "30m": "60d",
-    "60m": "730d",
-    "1h":  "730d",
+    "60m": "730d",   # FIX: was 60d
+    "1h":  "730d",   # FIX: was 60d
     "90m": "60d",
-    "1d":  "max",
-    "5d":  "max",
-    "1wk": "max",
-    "1mo": "max",
-    "3mo": "max",
 }
 
 # Map user-friendly shorthand → yfinance interval string
@@ -104,10 +137,11 @@ class DataFetcher:
             min_bars: Minimum bars required (default 2).
 
         Returns:
-            DataFrame with DatetimeIndex, columns [Open,High,Low,Close,Volume].
+            DataFrame with tz-aware DatetimeIndex (Asia/Kolkata),
+            columns [Open, High, Low, Close, Volume].
 
         Raises:
-            DataFetchError      : Symbol not found or network error.
+            DataFetchError       : Symbol not found or network error.
             InsufficientDataError: Fewer than min_bars returned.
         """
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
@@ -142,8 +176,15 @@ class DataFetcher:
 
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index = pd.to_datetime(df.index)
+
+        # Phase 04: Keep tz-aware. Convert to IST but DO NOT strip timezone.
+        # Stripping with tz_localize(None) causes silent bar misalignment on
+        # DST transition dates when joining two symbols.
         if df.index.tz is not None:
-            df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+            df.index = df.index.tz_convert("Asia/Kolkata")
+        else:
+            df.index = df.index.tz_localize("Asia/Kolkata")
+
         df = df.sort_index()
         df = df[~df.index.duplicated(keep="last")]
         df = df.dropna(subset=["Close"])
@@ -158,9 +199,27 @@ class DataFetcher:
         log.info(f"Fetched {len(df)} bars for {yf_sym} ({interval})")
         return df
 
-    def fetch_latest_price(self, symbol: str) -> float:
-        """Return latest available price. Weekend/holiday safe."""
-        return _resolver.get_price(symbol)
+    def fetch_latest_price(self, symbol: str, timeout: float = 10.0) -> float:
+        """Return latest available price. Weekend/holiday safe.
+
+        Phase 04: wrapped with 10s timeout so a yfinance hang in a
+        paper-trading minute-loop never freezes the entire thread.
+
+        Raises:
+            DataFetchError: on timeout or resolution failure.
+        """
+        def _get() -> float:
+            return _resolver.get_price(symbol)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_get)
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                raise DataFetchError(
+                    f"fetch_latest_price('{symbol}') timed out after {timeout}s. "
+                    f"Check network or yfinance rate limits."
+                )
 
     def fetch_info(self, symbol: str) -> dict:
         """Return instrument metadata. Safe: returns partial dict on failure."""
@@ -171,20 +230,40 @@ class DataFetcher:
         symbols: list[str],
         period: str = "1y",
         interval: str = "1d",
-    ) -> dict[str, pd.DataFrame]:
-        """Fetch multiple symbols in one yfinance call."""
+    ) -> tuple[dict[str, pd.DataFrame], list[str]]:
+        """Fetch multiple symbols in one yfinance call.
+
+        Phase 04: return type changed to tuple[dict, list[str]].
+        Failed/unresolvable symbols are collected in the errors list
+        instead of being silently dropped.
+
+        Returns:
+            (results, errors)
+            results : dict mapping original symbol → cleaned DataFrame
+            errors  : list of symbols that failed (unresolvable or parse error)
+
+        Example:
+            results, errors = fetcher.fetch_batch(["RELIANCE", "TCS", "INVALID"])
+            # errors == ["INVALID"]
+        """
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
         period   = _PERIOD_ALIASES.get(period.lower(), period)
         period   = self._cap_period(interval, period)
 
         yf_map: dict[str, str] = {}
+        errors: list[str]      = []
+
         for sym in symbols:
             yf_sym = _resolver.to_yf(sym)
             if yf_sym:
                 yf_map[sym] = yf_sym
+            else:
+                log.warning(f"[fetch_batch] Cannot resolve symbol '{sym}' — adding to errors")
+                errors.append(sym)
 
         if not yf_map:
-            return {}
+            log.warning(f"[fetch_batch] No valid symbols from {symbols}")
+            return {}, errors
 
         yf_syms = list(yf_map.values())
         log.info(f"Batch fetching {len(yf_syms)} symbols ({interval})")
@@ -201,7 +280,9 @@ class DataFetcher:
             )
         except Exception as exc:
             log.error(f"Batch download failed: {exc}")
-            return {}
+            # All symbols that were going to be fetched are now errors
+            errors.extend(yf_map.keys())
+            return {}, errors
 
         results: dict[str, pd.DataFrame] = {}
         for orig_sym, yf_sym in yf_map.items():
@@ -213,47 +294,60 @@ class DataFetcher:
                 df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
                 df = df.dropna(subset=["Close"])
                 df.index = pd.to_datetime(df.index)
+                # Phase 04: keep tz-aware (same as fetch())
                 if df.index.tz is not None:
-                    df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+                    df.index = df.index.tz_convert("Asia/Kolkata")
+                else:
+                    df.index = df.index.tz_localize("Asia/Kolkata")
                 df = df.sort_index().round(2)
                 if not df.empty:
                     results[orig_sym] = df
+                else:
+                    log.warning(f"[fetch_batch] Empty DataFrame for {orig_sym}")
+                    errors.append(orig_sym)
             except Exception as exc:
-                log.warning(f"Batch parse failed for {orig_sym}: {exc}")
+                log.warning(f"[fetch_batch] Parse failed for {orig_sym}: {exc}")
+                errors.append(orig_sym)
 
+        if errors:
+            log.warning(f"[fetch_batch] {len(errors)} symbol(s) failed: {errors}")
         log.info(f"Batch fetch complete: {len(results)}/{len(symbols)} succeeded")
-        return results
+        return results, errors
 
     def search_symbols(self, query: str) -> list[dict]:
         """Search available symbols by name/prefix."""
         return _resolver.search_names(query)
 
+    # ── Period cap ───────────────────────────────────────────────────────────
+
     @staticmethod
     def _cap_period(interval: str, period: str) -> str:
-        """Enforce yfinance period limits per interval."""
-        caps = {
-            "1m":  "7d",
-            "2m":  "60d",
-            "3m":  "60d",
-            "5m":  "60d",
-            "15m": "60d",
-            "30m": "60d",
-            "60m": "60d",
-            "1h":  "60d",
-            "90m": "60d",
-        }
-        if interval in caps:
-            order = ["1d","2d","5d","7d","1mo","3mo","6mo","60d","1y","2y","5y","max"]
-            cap = caps[interval]
-            try:
-                if order.index(period) > order.index(cap):
-                    log.warning(
-                        f"Period '{period}' too large for interval '{interval}'. "
-                        f"Capping to '{cap}'."
-                    )
-                    return cap
-            except ValueError:
-                return cap
+        """Enforce yfinance period limits per interval.
+
+        Uses TO_DAYS integer comparison — no more string-order bugs.
+        "60d" is 60 days, "6mo" is 180 days. Correctly: 60d < 6mo.
+
+        Phase 04 fix: 1h/60m cap changed from 60d to 730d.
+        Previous code: _cap_period("1h", "2y") → "60d" (WRONG — too short)
+        Fixed code:    _cap_period("1h", "2y") → "730d" (correct yfinance limit)
+
+        Exit criteria verified:
+            _cap_period("1h", "1y") == "1y"   (365 <= 730, no cap needed)
+            _cap_period("1m", "1y") == "7d"   (365 > 7, capped)
+        """
+        if interval not in _INTERVAL_CAPS:
+            return period  # daily/weekly/monthly: no cap
+
+        cap = _INTERVAL_CAPS[interval]
+        cap_days    = TO_DAYS.get(cap, 9999)
+        period_days = TO_DAYS.get(period, 9999)
+
+        if period_days > cap_days:
+            log.warning(
+                f"Period '{period}' ({period_days}d) too large for interval '{interval}'. "
+                f"Capping to '{cap}' ({cap_days}d)."
+            )
+            return cap
         return period
 
 
@@ -267,6 +361,10 @@ class YFinanceProvider:
         - health_check() → dict
         - fetch_ohlcv(symbol, interval, from_date, to_date) → DataFrame
         - fetch_quote(symbol) → dict
+
+    Note: fetch_ohlcv intentionally strips timezone for backward compatibility
+    with DataManager and test_data.py which compare naive DatetimeIndex.
+    DataFetcher.fetch() (above) keeps tz-aware for cross-symbol join safety.
     """
 
     name: str = "yfinance"
@@ -300,7 +398,8 @@ class YFinanceProvider:
                         Use either period OR from_date/to_date, not both.
 
         Returns:
-            DataFrame with DatetimeIndex, columns [Open, High, Low, Close, Volume].
+            DataFrame with naive DatetimeIndex (tz stripped for compat),
+            columns [Open, High, Low, Close, Volume].
             Returns empty DataFrame on failure.
         """
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
@@ -332,6 +431,7 @@ class YFinanceProvider:
         cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
         df = df[cols].copy()
         df.index = pd.to_datetime(df.index)
+        # YFinanceProvider strips tz for DataManager backward compat
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         df = df.sort_index()

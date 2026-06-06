@@ -1,18 +1,30 @@
-"""Data Validator — Phase 2.
+"""Data Validator — Phase 04 expanded.
 
 Every dataset passes through this before use in backtesting or UI.
 Never backtest bad data.
 
 Checks:
-  1. Missing candles (gap detection by calendar)
-  2. Duplicate timestamps
-  3. Zero / null OHLCV values
-  4. Price spikes (single candle >20% move)
-  5. Volume = 0 on a trading row
-  6. Split detection (close-to-open gap >40%)
-  7. OHLC sanity (High >= Low, High >= Close, Low <= Close)
-  8. Weekend rows in daily data
-  9. Minimum bar count
+  1.  Missing candles (gap detection by calendar)
+  2.  Duplicate timestamps
+  3.  Zero / null Close values
+  4.  Price spikes (single candle >20% move)
+  5.  Volume = 0 on a trading row
+  6.  Split detection (close-to-open gap >40%)
+  7.  OHLC sanity full 4-way:
+        High >= Low
+        High >= Open
+        High >= Close
+        Low  <= Open
+        Low  <= Close
+  8.  Weekend rows in daily data
+  9.  Minimum bar count
+  10. >5% NaN Close values → FAIL issue (not just warning)
+
+Phase 04 additions:
+  - Full 4-way OHLC check (was only High>=Low)
+  - >5% NaN Close → issues list (was only warning)
+  - Volume >= 0 sanity (negative volume guard)
+  - failed_bars list in ValidationResult for per-bar detail
 
 Usage:
     from data.validator import DataValidator
@@ -44,6 +56,7 @@ class ValidationResult:
     issues: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     rows_removed: int = 0
+    failed_bars: List[str] = field(default_factory=list)  # Phase 04: per-bar detail
     clean_df: Optional[pd.DataFrame] = None
 
     def __str__(self) -> str:
@@ -55,6 +68,8 @@ class ValidationResult:
             lines.append(f"  [WARN]  {w}")
         if self.rows_removed:
             lines.append(f"  Rows removed by auto-clean: {self.rows_removed}")
+        if self.failed_bars:
+            lines.append(f"  Failed bars ({len(self.failed_bars)}): " + ", ".join(self.failed_bars[:5]))
         return "\n".join(lines)
 
 
@@ -66,10 +81,12 @@ class DataValidator:
         spike_threshold: float = 0.20,   # 20% single-candle move = spike
         split_threshold: float = 0.40,   # 40% gap = possible split
         min_bars: int = 5,
+        max_nan_close_pct: float = 0.05, # Phase 04: >5% NaN Close = FAIL
     ) -> None:
-        self.spike_threshold = spike_threshold
-        self.split_threshold = split_threshold
-        self.min_bars = min_bars
+        self.spike_threshold    = spike_threshold
+        self.split_threshold    = split_threshold
+        self.min_bars           = min_bars
+        self.max_nan_close_pct  = max_nan_close_pct
 
     def validate(
         self,
@@ -97,12 +114,13 @@ class DataValidator:
                 clean_df=pd.DataFrame(),
             )
 
-        issues: List[str] = []
-        warnings: List[str] = []
+        issues: List[str]      = []
+        warnings: List[str]    = []
+        failed_bars: List[str] = []
         clean = df.copy()
         original_len = len(clean)
 
-        # ─ 1. Required columns ───────────────────────────────────────────────
+        # ─ 1. Required columns ──────────────────────────────────────────────
         required = {"Open", "High", "Low", "Close", "Volume"}
         missing_cols = required - set(clean.columns)
         if missing_cols:
@@ -115,38 +133,85 @@ class DataValidator:
             warnings.append(f"{dupes} duplicate timestamps found — keeping last.")
             clean = clean[~clean.index.duplicated(keep="last")]
 
-        # ─ 3. Null / NaN close prices ────────────────────────────────────
+        # ─ 3a. NaN close — >5% is a FAIL ───────────────────────────────
         null_close = clean["Close"].isna().sum()
-        if null_close:
+        null_close_pct = null_close / max(len(clean), 1)
+        if null_close_pct > self.max_nan_close_pct:
+            issues.append(
+                f"{null_close} NaN Close values ({null_close_pct*100:.1f}%) — "
+                f"exceeds {self.max_nan_close_pct*100:.0f}% threshold. "
+                f"Data quality too low to use."
+            )
+        elif null_close:
             warnings.append(f"{null_close} rows with null Close — dropping.")
+        if null_close:
             clean = clean.dropna(subset=["Close"])
 
-        # ─ 4. Zero close prices ──────────────────────────────────────────
+        # ─ 3b. Zero close prices ───────────────────────────────────────
         zero_close = (clean["Close"] == 0).sum()
         if zero_close:
             warnings.append(f"{zero_close} rows with zero Close — dropping.")
             clean = clean[clean["Close"] > 0]
 
-        # ─ 5. OHLC sanity ─────────────────────────────────────────────────
-        bad_hl = (clean["High"] < clean["Low"]).sum()
-        if bad_hl:
-            warnings.append(f"{bad_hl} rows where High < Low — dropping.")
-            clean = clean[clean["High"] >= clean["Low"]]
+        # ─ 4. Negative volume (Phase 04: new guard) ────────────────────
+        neg_vol = (clean["Volume"] < 0).sum()
+        if neg_vol:
+            warnings.append(f"{neg_vol} rows with negative Volume — dropping.")
+            clean = clean[clean["Volume"] >= 0]
 
-        # ─ 6. Price spikes (>spike_threshold single candle) ────────────────
+        # ─ 5. OHLC sanity — full 4-way (Phase 04 expanded) ───────────────
+        #
+        # Rule:    High must be the maximum of O, H, L, C
+        #          Low  must be the minimum  of O, H, L, C
+        #
+        # Check all four inequalities independently so we can report
+        # exactly which rule failed for each bar.
+        #
+        bad_hl    = clean["High"] < clean["Low"]
+        bad_h_o   = clean["High"] < clean["Open"]
+        bad_h_c   = clean["High"] < clean["Close"]
+        bad_l_o   = clean["Low"]  > clean["Open"]
+        bad_l_c   = clean["Low"]  > clean["Close"]
+
+        ohlc_bad_mask = bad_hl | bad_h_o | bad_h_c | bad_l_o | bad_l_c
+        ohlc_bad_count = ohlc_bad_mask.sum()
+
+        if ohlc_bad_count:
+            # Record per-bar detail for failed_bars list
+            bad_idx = clean.index[ohlc_bad_mask]
+            for ts in bad_idx[:10]:  # cap at 10 entries
+                row = clean.loc[ts]
+                failed_bars.append(
+                    f"{str(ts)[:19]} O={row['Open']} H={row['High']} "
+                    f"L={row['Low']} C={row['Close']}"
+                )
+
+            detail_parts = []
+            if bad_hl.sum():  detail_parts.append(f"{bad_hl.sum()} High<Low")
+            if bad_h_o.sum(): detail_parts.append(f"{bad_h_o.sum()} High<Open")
+            if bad_h_c.sum(): detail_parts.append(f"{bad_h_c.sum()} High<Close")
+            if bad_l_o.sum(): detail_parts.append(f"{bad_l_o.sum()} Low>Open")
+            if bad_l_c.sum(): detail_parts.append(f"{bad_l_c.sum()} Low>Close")
+
+            warnings.append(
+                f"{ohlc_bad_count} OHLC sanity violations — dropping. "
+                + ", ".join(detail_parts)
+            )
+            clean = clean[~ohlc_bad_mask]
+
+        # ─ 6. Price spikes (>spike_threshold single candle) ──────────────
         if len(clean) > 2:
             pct_change = clean["Close"].pct_change().abs()
             spike_mask = pct_change > self.spike_threshold
             spike_count = spike_mask.sum()
             if spike_count:
-                # Warning only — do NOT auto-remove spikes (could be real gap-up)
                 worst = float(pct_change[spike_mask].max() * 100)
                 warnings.append(
                     f"{spike_count} potential price spikes detected (>{self.spike_threshold*100:.0f}%). "
                     f"Worst: {worst:.1f}%. Verify splits/dividends."
                 )
 
-        # ─ 7. Split detection (close-to-open gap >split_threshold) ─────────
+        # ─ 7. Split detection (close-to-open gap >split_threshold) ───────
         if len(clean) > 2 and interval in ("1d", "1wk", "1mo"):
             prev_close = clean["Close"].shift(1)
             gap = ((clean["Open"] - prev_close) / prev_close).abs()
@@ -159,13 +224,13 @@ class DataValidator:
                     + ", ".join(str(d)[:10] for d in dates)
                 )
 
-        # ─ 8. Zero volume rows (only flag for daily+, intraday can have 0 vol) ─
+        # ─ 8. Zero volume rows (daily+ only) ────────────────────────────
         if interval in ("1d", "1wk", "1mo"):
             zero_vol = (clean["Volume"] == 0).sum()
             if zero_vol > 0:
                 warnings.append(f"{zero_vol} rows with zero volume (possible holiday/halt rows).")
 
-        # ─ 9. Weekend rows in daily data ──────────────────────────────────
+        # ─ 9. Weekend rows in daily data ─────────────────────────────
         if interval == "1d":
             weekend_mask = clean.index.dayofweek >= 5
             weekend_count = weekend_mask.sum()
@@ -173,12 +238,11 @@ class DataValidator:
                 warnings.append(f"{weekend_count} weekend rows found — dropping.")
                 clean = clean[~weekend_mask]
 
-        # ─ 10. Gap detection (missing candles) ────────────────────────────
+        # ─ 10. Gap detection (missing candles) ─────────────────────────
         if len(clean) > 2 and interval in ("1m", "3m", "5m", "15m", "30m", "1h"):
             freq_map = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
             expected_gap = pd.Timedelta(minutes=freq_map.get(interval, 5))
             actual_gaps = clean.index.to_series().diff().dropna()
-            # Only flag gaps larger than 2x expected (ignores lunch breaks etc.)
             big_gaps = actual_gaps[actual_gaps > expected_gap * 4]
             if len(big_gaps) > 0:
                 warnings.append(
@@ -186,7 +250,7 @@ class DataValidator:
                     f"(possible market halt or missing bars)."
                 )
 
-        # ─ 11. Minimum bars after cleaning ────────────────────────────────
+        # ─ 11. Minimum bars after cleaning ────────────────────────────
         if len(clean) < self.min_bars:
             issues.append(
                 f"Only {len(clean)} bars after cleaning (minimum {self.min_bars}). "
@@ -208,5 +272,6 @@ class DataValidator:
             issues=issues,
             warnings=warnings,
             rows_removed=rows_removed,
+            failed_bars=failed_bars,
             clean_df=clean if auto_clean else df,
         )

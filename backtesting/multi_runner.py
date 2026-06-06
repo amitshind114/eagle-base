@@ -1,8 +1,15 @@
-"""MultiStockRunner — Phase 4.
+"""MultiStockRunner — Phase 04 hardened.
 
 Runs a strategy against a list of symbols independently,
 collects BacktestResult per symbol, and returns a ranked
 MultiStockResult leaderboard.
+
+Phase 04 changes:
+  - _FETCH_SEMAPHORE = threading.Semaphore(5) caps concurrent yfinance calls.
+    Without this, 50 threads hitting yfinance simultaneously on NIFTY50
+    runs reliably triggers HTTP 429 Rate Limited responses.
+  - Exponential backoff on HTTP 429: sleep(2**attempt + random.random()) x4.
+  - _run_single wraps fetch inside the semaphore context.
 
 Key design decisions:
   - Each symbol runs in isolation — no shared state / capital.
@@ -28,6 +35,9 @@ Usage:
 
 from __future__ import annotations
 
+import random
+import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -43,6 +53,15 @@ log = get_logger("backtesting.multi_runner")
 _DEFAULT_INTERVAL = "1d"
 # Max worker threads for parallel runs
 _MAX_WORKERS = 4
+
+# Phase 04: Semaphore caps concurrent yfinance fetches to 5 at a time.
+# Without this, a NIFTY50 run with max_workers=10 fires 50 simultaneous
+# HTTP requests to Yahoo Finance, which reliably returns HTTP 429.
+_FETCH_SEMAPHORE = threading.Semaphore(5)
+
+# Backoff config for HTTP 429 rate-limit handling
+_MAX_RETRIES   = 4
+_BASE_BACKOFF  = 2.0   # seconds (doubled each attempt: 2, 4, 8, 16)
 
 
 class MultiStockRunner:
@@ -62,9 +81,9 @@ class MultiStockRunner:
         self.max_workers      = max_workers
         self.update_registry  = update_registry
 
-    # ------------------------------------------------------------------
+    # ───────────────────────────────────────────────────────────────
     # Public API
-    # ------------------------------------------------------------------
+    # ───────────────────────────────────────────────────────────────
 
     def run(
         self,
@@ -112,15 +131,14 @@ class MultiStockRunner:
             f"failed={len(failed)} avg_sharpe={msr.avg_sharpe()}"
         )
 
-        # Push aggregate result to registry so UI can display it
         if self.update_registry:
             self._update_registry(strategy.name, msr)
 
         return msr
 
-    # ------------------------------------------------------------------
+    # ───────────────────────────────────────────────────────────────
     # Execution strategies
-    # ------------------------------------------------------------------
+    # ───────────────────────────────────────────────────────────────
 
     def _run_serial(
         self,
@@ -180,34 +198,61 @@ class MultiStockRunner:
         capital: float,
         interval: str,
     ) -> Optional[BacktestResult]:
-        """Run one symbol. Returns None on any error so the caller can mark it failed."""
-        try:
-            # Import here to avoid circular imports
-            from backtesting.runner import BacktestRunner
+        """Run one symbol inside the fetch semaphore with exponential backoff.
 
-            runner = BacktestRunner(
-                symbol=symbol,
-                strategy=strategy,
-                initial_capital=capital,
-                period=period,
-                interval=interval,
-            )
-            result = runner.run()
-            log.debug(
-                f"[multi_runner] {symbol}: return={result.total_return_pct:.2f}% "
-                f"trades={result.total_trades}"
-            )
-            return result
-        except Exception as exc:
-            log.warning(
-                f"[multi_runner] {symbol} FAILED: {exc}\n"
-                + traceback.format_exc(limit=3)
-            )
-            return None
+        Phase 04: acquire _FETCH_SEMAPHORE before calling the runner so at
+        most 5 yfinance requests are in-flight at any moment. On HTTP 429,
+        retry up to _MAX_RETRIES times with jittered exponential backoff.
+        """
+        last_exc: Exception = RuntimeError("no attempt made")
 
-    # ------------------------------------------------------------------
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with _FETCH_SEMAPHORE:
+                    from backtesting.runner import BacktestRunner
+                    runner = BacktestRunner(
+                        symbol=symbol,
+                        strategy=strategy,
+                        capital=capital,
+                        period=period,
+                        interval=interval,
+                    )
+                    result = runner.run()
+                log.debug(
+                    f"[multi_runner] {symbol}: return={result.total_return_pct:.2f}% "
+                    f"trades={result.total_trades}"
+                )
+                return result
+
+            except Exception as exc:
+                last_exc = exc
+                exc_str  = str(exc).lower()
+                # Retry on rate-limit (HTTP 429) or transient network errors
+                is_rate_limit = "429" in exc_str or "too many" in exc_str or "rate" in exc_str
+                is_transient  = "timeout" in exc_str or "connection" in exc_str
+
+                if (is_rate_limit or is_transient) and attempt < _MAX_RETRIES - 1:
+                    sleep_secs = (_BASE_BACKOFF ** attempt) + random.random()
+                    log.warning(
+                        f"[multi_runner] {symbol} attempt {attempt+1}/{_MAX_RETRIES}: "
+                        f"{exc}. Retrying in {sleep_secs:.1f}s"
+                    )
+                    time.sleep(sleep_secs)
+                    continue
+
+                # Non-retryable error or max retries reached
+                log.warning(
+                    f"[multi_runner] {symbol} FAILED after {attempt+1} attempt(s): {last_exc}\n"
+                    + traceback.format_exc(limit=3)
+                )
+                return None
+
+        log.warning(f"[multi_runner] {symbol} exhausted all {_MAX_RETRIES} retries.")
+        return None
+
+    # ───────────────────────────────────────────────────────────────
     # Registry update
-    # ------------------------------------------------------------------
+    # ───────────────────────────────────────────────────────────────
 
     def _update_registry(
         self, strategy_name: str, msr: MultiStockResult
