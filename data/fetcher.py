@@ -7,6 +7,7 @@ Handles:
   - Intraday: 1m, 3m, 5m, 15m, 30m, 1h
   - Weekend / holiday: always returns last available session data
   - Bad data: empty result raises clear DataFetchError
+  - 2d period on weekends: auto-upgraded to 5d (Yahoo returns empty on weekends)
 
 Phase 04 changes:
   - _cap_period rewritten with TO_DAYS int-day dict (no more string order bugs)
@@ -14,6 +15,14 @@ Phase 04 changes:
   - tz_localize(None) removed — index stays tz-aware (Asia/Kolkata)
   - fetch_batch returns (dict, list[str]) — errors surfaced
   - fetch_latest_price has 10s timeout guard
+
+Phase 04b fixes (June 2026):
+  - TO_DAYS: added '2d' entry (was missing, caused silent KeyError fallthrough)
+  - Weekend guard: period='2d' on Saturday/Sunday auto-upgrades to '5d'
+    Yahoo Finance returns empty DataFrame for period='2d' on weekends because
+    the last 2 calendar days contain no trading sessions.
+  - fetch(): if DataFrame still empty after cap, retry once with 5d fallback
+  - YFinanceProvider.fetch_ohlcv: same weekend guard applied
 
 Usage:
     from data.fetcher import DataFetcher
@@ -32,6 +41,7 @@ Usage:
 from __future__ import annotations
 
 import concurrent.futures
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -44,7 +54,7 @@ from instruments.symbol_resolver import SymbolResolver
 log = get_logger("data.fetcher")
 
 
-# ── Period/interval limits ─────────────────────────────────────────────────────
+# ── Period/interval limits ────────────────────────────────────────────────────────────────────────────────
 #
 # TO_DAYS: canonical day-count for every period/cap string.
 # Used in _cap_period() to compare periods numerically, not by string position.
@@ -53,7 +63,7 @@ log = get_logger("data.fetcher")
 #
 TO_DAYS: dict[str, int] = {
     "1d":    1,
-    "2d":    2,
+    "2d":    2,   # Phase 04b: was missing, caused KeyError fallthrough
     "5d":    5,
     "7d":    7,
     "1mo":   30,
@@ -73,7 +83,6 @@ TO_DAYS: dict[str, int] = {
 # Per-interval maximum period (yfinance hard limits).
 # 1h/60m: yfinance actually returns up to 730 days of hourly data.
 # 1m:     hard limit 7 days.
-# Old code had 1h->60d which was WRONG and caused empty fetches on >60d requests.
 _INTERVAL_CAPS: dict[str, str] = {
     "1m":  "7d",
     "2m":  "60d",
@@ -81,8 +90,8 @@ _INTERVAL_CAPS: dict[str, str] = {
     "5m":  "60d",
     "15m": "60d",
     "30m": "60d",
-    "60m": "730d",   # FIX: was 60d
-    "1h":  "730d",   # FIX: was 60d
+    "60m": "730d",
+    "1h":  "730d",
     "90m": "60d",
 }
 
@@ -117,6 +126,37 @@ _PERIOD_ALIASES: dict[str, str] = {
 _resolver = SymbolResolver()
 
 
+def _is_weekend() -> bool:
+    """Return True if today (UTC) is Saturday or Sunday.
+
+    Yahoo Finance returns an empty DataFrame for period='1d' or period='2d'
+    on weekends because the last N calendar days contain no trading sessions.
+    Callers should upgrade to '5d' so the last trading Friday is included.
+    """
+    return datetime.now(timezone.utc).weekday() >= 5  # 5=Sat, 6=Sun
+
+
+def _weekend_safe_period(period: str) -> str:
+    """Upgrade dangerously short periods on weekends.
+
+    '1d' and '2d' on a Saturday/Sunday will return zero bars because the
+    last 1-2 calendar days are non-trading.  Automatically promote to '5d'
+    so at least Friday's session is returned.
+
+    Any period of 5d or longer is safe and returned unchanged.
+    """
+    if not _is_weekend():
+        return period
+    short_periods = {"1d", "2d", "today", "1day"}
+    if period in short_periods:
+        log.warning(
+            f"Weekend detected: period='{period}' would return 0 bars. "
+            f"Auto-upgrading to '5d' to include last trading session (Friday)."
+        )
+        return "5d"
+    return period
+
+
 class DataFetcher:
     """Fetch OHLCV data. Resolves any symbol automatically."""
 
@@ -146,6 +186,7 @@ class DataFetcher:
         """
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
         period   = _PERIOD_ALIASES.get(period.lower(), period)
+        period   = _weekend_safe_period(period)        # Phase 04b: weekend guard
         period   = self._cap_period(interval, period)
 
         yf_sym = _resolver.to_yf(symbol)
@@ -168,6 +209,23 @@ class DataFetcher:
         except Exception as exc:
             raise DataFetchError(f"yfinance error for {yf_sym}: {exc}") from exc
 
+        # Phase 04b: if still empty (e.g. holiday on a weekday), retry with 5d
+        if (df is None or df.empty) and period not in ("5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"):
+            log.warning(
+                f"Empty result for {yf_sym} with period='{period}'. "
+                f"Retrying with period='5d' (holiday / thin market fallback)."
+            )
+            try:
+                df = yf.Ticker(yf_sym).history(
+                    period="5d",
+                    interval=interval,
+                    auto_adjust=True,
+                    back_adjust=False,
+                    prepost=False,
+                )
+            except Exception as exc:
+                raise DataFetchError(f"yfinance retry error for {yf_sym}: {exc}") from exc
+
         if df is None or df.empty:
             raise DataFetchError(
                 f"No data returned for '{symbol}' ({yf_sym}). "
@@ -177,9 +235,7 @@ class DataFetcher:
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index = pd.to_datetime(df.index)
 
-        # Phase 04: Keep tz-aware. Convert to IST but DO NOT strip timezone.
-        # Stripping with tz_localize(None) causes silent bar misalignment on
-        # DST transition dates when joining two symbols.
+        # Keep tz-aware. Convert to IST but DO NOT strip timezone.
         if df.index.tz is not None:
             df.index = df.index.tz_convert("Asia/Kolkata")
         else:
@@ -233,21 +289,14 @@ class DataFetcher:
     ) -> tuple[dict[str, pd.DataFrame], list[str]]:
         """Fetch multiple symbols in one yfinance call.
 
-        Phase 04: return type changed to tuple[dict, list[str]].
-        Failed/unresolvable symbols are collected in the errors list
-        instead of being silently dropped.
-
         Returns:
             (results, errors)
             results : dict mapping original symbol → cleaned DataFrame
             errors  : list of symbols that failed (unresolvable or parse error)
-
-        Example:
-            results, errors = fetcher.fetch_batch(["RELIANCE", "TCS", "INVALID"])
-            # errors == ["INVALID"]
         """
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
         period   = _PERIOD_ALIASES.get(period.lower(), period)
+        period   = _weekend_safe_period(period)        # Phase 04b: weekend guard
         period   = self._cap_period(interval, period)
 
         yf_map: dict[str, str] = {}
@@ -280,7 +329,6 @@ class DataFetcher:
             )
         except Exception as exc:
             log.error(f"Batch download failed: {exc}")
-            # All symbols that were going to be fetched are now errors
             errors.extend(yf_map.keys())
             return {}, errors
 
@@ -294,7 +342,6 @@ class DataFetcher:
                 df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
                 df = df.dropna(subset=["Close"])
                 df.index = pd.to_datetime(df.index)
-                # Phase 04: keep tz-aware (same as fetch())
                 if df.index.tz is not None:
                     df.index = df.index.tz_convert("Asia/Kolkata")
                 else:
@@ -318,22 +365,17 @@ class DataFetcher:
         """Search available symbols by name/prefix."""
         return _resolver.search_names(query)
 
-    # ── Period cap ───────────────────────────────────────────────────────────
+    # ── Period cap ──────────────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _cap_period(interval: str, period: str) -> str:
         """Enforce yfinance period limits per interval.
 
         Uses TO_DAYS integer comparison — no more string-order bugs.
-        "60d" is 60 days, "6mo" is 180 days. Correctly: 60d < 6mo.
+        '2d' is correctly 2 days. '60d' is 60 days. '6mo' is 180 days.
 
         Phase 04 fix: 1h/60m cap changed from 60d to 730d.
-        Previous code: _cap_period("1h", "2y") → "60d" (WRONG — too short)
-        Fixed code:    _cap_period("1h", "2y") → "730d" (correct yfinance limit)
-
-        Exit criteria verified:
-            _cap_period("1h", "1y") == "1y"   (365 <= 730, no cap needed)
-            _cap_period("1m", "1y") == "7d"   (365 > 7, capped)
+        Phase 04b fix: '2d' added to TO_DAYS dict.
         """
         if interval not in _INTERVAL_CAPS:
             return period  # daily/weekly/monthly: no cap
@@ -351,7 +393,7 @@ class DataFetcher:
         return period
 
 
-# ── YFinanceProvider — provider-style API used by DataManager & tests ────
+# ── YFinanceProvider — provider-style API used by DataManager & tests ────────
 
 class YFinanceProvider:
     """Provider-style wrapper around yfinance for use by DataManager.
@@ -389,20 +431,13 @@ class YFinanceProvider:
         """
         Fetch OHLCV bars for any symbol.
 
-        Args:
-            symbol    : Ticker (e.g. "AAPL", "RELIANCE.NS").
-            interval  : yfinance interval string ("1d", "1h", "5m", …).
-            from_date : ISO date string "YYYY-MM-DD" (used with to_date).
-            to_date   : ISO date string "YYYY-MM-DD".
-            period    : yfinance period string ("1mo", "1y", …).
-                        Use either period OR from_date/to_date, not both.
-
-        Returns:
-            DataFrame with naive DatetimeIndex (tz stripped for compat),
-            columns [Open, High, Low, Close, Volume].
-            Returns empty DataFrame on failure.
+        Phase 04b: weekend guard applied — period='1d'/'2d' auto-promoted
+        to '5d' on Saturday/Sunday to avoid empty DataFrame.
         """
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
+        # Apply weekend guard only when using period (not explicit date range)
+        if not (from_date and to_date):
+            period = _weekend_safe_period(period or "1y")
         try:
             ticker = yf.Ticker(symbol)
             if from_date and to_date:

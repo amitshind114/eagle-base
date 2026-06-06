@@ -15,6 +15,7 @@ httpx>=0.24.0
 scipy>=1.11.0
 pandas-ta>=0.3.14b
 pyarrow>=13.0.0
+matplotlib>=3.7.0
 
 # NSE instrument master sources (tries each in order, uses first that works)
 nsepython>=1.0.0
