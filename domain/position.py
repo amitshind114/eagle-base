@@ -8,7 +8,7 @@ average exit, and exposure in real time.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -36,8 +36,8 @@ class Position(BaseModel):
     last_price: float = Field(default=0.0, ge=0)
     realized_pnl: float = Field(default=0.0)
     commission_paid: float = Field(default=0.0, ge=0)
-    opened_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     strategy_name: str = Field(default="")
     trades: List[Trade] = Field(default_factory=list)
     is_open: bool = Field(default=True)
@@ -84,7 +84,7 @@ class Position(BaseModel):
         self.quantity += fill_qty
         self.average_entry_price = total_value / self.quantity
         self.commission_paid += commission
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(UTC)
         logger.debug(
             f"Position {self.symbol}: +{fill_qty} @ {fill_price:.2f} "
             f"avg_entry={self.average_entry_price:.2f} qty={self.quantity}"
@@ -111,7 +111,7 @@ class Position(BaseModel):
         self.realized_pnl += net_pnl
         self.commission_paid += commission
         self.quantity -= close_qty
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(UTC)
 
         if self.quantity == 0:
             self.is_open = False
@@ -124,7 +124,7 @@ class Position(BaseModel):
             entry_price=self.average_entry_price,
             exit_price=exit_price,
             entry_time=self.opened_at,
-            exit_time=datetime.utcnow(),
+            exit_time=datetime.now(UTC),
             commission=commission,
             strategy_name=self.strategy_name,
         )

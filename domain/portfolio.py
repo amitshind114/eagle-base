@@ -7,7 +7,7 @@ closed trades, and equity curve in real time.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -48,8 +48,8 @@ class Portfolio(BaseModel):
     open_positions: Dict[str, Position] = Field(default_factory=dict)
     closed_trades: List[Trade] = Field(default_factory=list)
     equity_curve: List[EquityPoint] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def model_post_init(self, __context) -> None:
         """Initialise cash to initial_capital on first creation."""
@@ -111,7 +111,7 @@ class Portfolio(BaseModel):
             self.open_positions[position.symbol] = position
             logger.info(f"Portfolio: opened new position {position.symbol}")
         self.cash -= position.exposure
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(UTC)
 
     def close_position(self, symbol: str, exit_price: float, commission: float = 0.0) -> Optional[Trade]:
         """Fully close a position. Returns the resulting Trade."""
@@ -122,7 +122,7 @@ class Portfolio(BaseModel):
         trade = position.close(exit_price, commission)
         self.closed_trades.append(trade)
         self.cash += trade.quantity * exit_price
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(UTC)
         logger.info(f"Portfolio: closed {symbol} trade pnl={trade.net_pnl:.2f}")
         return trade
 
@@ -131,12 +131,12 @@ class Portfolio(BaseModel):
         for symbol, price in prices.items():
             if symbol in self.open_positions:
                 self.open_positions[symbol].update_last_price(price)
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(UTC)
 
     def snapshot_equity(self, timestamp: Optional[datetime] = None) -> EquityPoint:
         """Record current equity to the equity curve."""
         point = EquityPoint(
-            timestamp=timestamp or datetime.utcnow(),
+            timestamp=timestamp or datetime.now(UTC),
             equity=self.equity,
             cash=self.cash,
             unrealized_pnl=self.total_unrealized_pnl,
