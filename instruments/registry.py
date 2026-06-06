@@ -10,6 +10,7 @@ Usage:
     inst = reg.get("RELIANCE")          # → Instrument
     results = reg.search("HDFC")        # → list[Instrument]
     syms = reg.list_by_segment("FUT")   # → list[Instrument]
+    underlyings = reg.list_underlyings() # → list[str]  e.g. ["RELIANCE","TCS",...]
 """
 
 from __future__ import annotations
@@ -26,26 +27,26 @@ log = get_logger("instruments.registry")
 
 # ── Fallback hardcoded universe (used only if SQLite master is empty) ─────
 _FALLBACK: dict[str, dict] = {
-    "RELIANCE": {"name": "Reliance Industries", "sector": "Energy", "lot_size": 250},
-    "TCS": {"name": "Tata Consultancy Services", "sector": "IT", "lot_size": 150},
-    "HDFCBANK": {"name": "HDFC Bank", "sector": "Banking", "lot_size": 550},
-    "INFY": {"name": "Infosys", "sector": "IT", "lot_size": 300},
-    "ICICIBANK": {"name": "ICICI Bank", "sector": "Banking", "lot_size": 700},
-    "ITC": {"name": "ITC Ltd", "sector": "FMCG", "lot_size": 3200},
-    "SBIN": {"name": "State Bank of India", "sector": "Banking", "lot_size": 1500},
-    "HINDUNILVR": {"name": "Hindustan Unilever", "sector": "FMCG", "lot_size": 300},
-    "BHARTIARTL": {"name": "Bharti Airtel", "sector": "Telecom", "lot_size": 950},
-    "KOTAKBANK": {"name": "Kotak Mahindra Bank", "sector": "Banking", "lot_size": 400},
-    "LT": {"name": "Larsen & Toubro", "sector": "Infrastructure", "lot_size": 175},
-    "WIPRO": {"name": "Wipro", "sector": "IT", "lot_size": 1500},
-    "AXISBANK": {"name": "Axis Bank", "sector": "Banking", "lot_size": 1200},
-    "MARUTI": {"name": "Maruti Suzuki", "sector": "Auto", "lot_size": 100},
-    "TATAMOTORS": {"name": "Tata Motors", "sector": "Auto", "lot_size": 1425},
-    "SUNPHARMA": {"name": "Sun Pharma", "sector": "Pharma", "lot_size": 700},
-    "TITAN": {"name": "Titan Company", "sector": "Consumer", "lot_size": 375},
-    "BAJFINANCE": {"name": "Bajaj Finance", "sector": "NBFC", "lot_size": 125},
-    "NIFTY": {"name": "Nifty 50 Index", "sector": "Index", "lot_size": 50, "segment": "IDX"},
-    "BANKNIFTY": {"name": "Bank Nifty Index", "sector": "Index", "lot_size": 15, "segment": "IDX"},
+    "RELIANCE":   {"name": "Reliance Industries",       "sector": "Energy",         "lot_size": 250},
+    "TCS":        {"name": "Tata Consultancy Services", "sector": "IT",             "lot_size": 150},
+    "HDFCBANK":   {"name": "HDFC Bank",                 "sector": "Banking",        "lot_size": 550},
+    "INFY":       {"name": "Infosys",                   "sector": "IT",             "lot_size": 300},
+    "ICICIBANK":  {"name": "ICICI Bank",                "sector": "Banking",        "lot_size": 700},
+    "ITC":        {"name": "ITC Ltd",                   "sector": "FMCG",          "lot_size": 3200},
+    "SBIN":       {"name": "State Bank of India",       "sector": "Banking",        "lot_size": 1500},
+    "HINDUNILVR": {"name": "Hindustan Unilever",        "sector": "FMCG",          "lot_size": 300},
+    "BHARTIARTL": {"name": "Bharti Airtel",             "sector": "Telecom",        "lot_size": 950},
+    "KOTAKBANK":  {"name": "Kotak Mahindra Bank",       "sector": "Banking",        "lot_size": 400},
+    "LT":         {"name": "Larsen & Toubro",           "sector": "Infrastructure", "lot_size": 175},
+    "WIPRO":      {"name": "Wipro",                     "sector": "IT",             "lot_size": 1500},
+    "AXISBANK":   {"name": "Axis Bank",                 "sector": "Banking",        "lot_size": 1200},
+    "MARUTI":     {"name": "Maruti Suzuki",             "sector": "Auto",           "lot_size": 100},
+    "TATAMOTORS": {"name": "Tata Motors",               "sector": "Auto",           "lot_size": 1425},
+    "SUNPHARMA":  {"name": "Sun Pharma",                "sector": "Pharma",         "lot_size": 700},
+    "TITAN":      {"name": "Titan Company",             "sector": "Consumer",       "lot_size": 375},
+    "BAJFINANCE": {"name": "Bajaj Finance",             "sector": "NBFC",           "lot_size": 125},
+    "NIFTY":      {"name": "Nifty 50 Index",            "sector": "Index",          "lot_size": 50,  "segment": "IDX"},
+    "BANKNIFTY":  {"name": "Bank Nifty Index",          "sector": "Index",          "lot_size": 15,  "segment": "IDX"},
 }
 
 
@@ -82,16 +83,29 @@ class InstrumentRegistry:
         return self._fallback_search(query)
 
     def list_by_segment(self, segment: str) -> List[Instrument]:
-        """List all instruments for a segment."""
+        """List all instruments for a segment (EQ / FUT / CE / PE / IDX)."""
         if self._use_db:
             return self._search.list_segment(segment)
         return [i for i in self._fallback_all() if i.segment == segment.upper()]
 
     def list_fo_underlyings(self) -> List[str]:
-        """List all F&O eligible underlyings."""
+        """List all F&O eligible underlying symbols (e.g. RELIANCE, NIFTY)."""
         if self._use_db:
             return self._search.list_fo_underlyings()
         return list(_FALLBACK.keys())
+
+    def list_underlyings(self) -> List[str]:
+        """Alias for list_fo_underlyings().
+
+        Returns every symbol that has futures or options listed on NSE.
+        Used by MultiStockRunner, PortfolioEngine, and Walk-Forward tester.
+
+        Example:
+            reg = InstrumentRegistry()
+            symbols = reg.list_underlyings()
+            # → ["RELIANCE", "TCS", "HDFCBANK", ..., "NIFTY", "BANKNIFTY"]
+        """
+        return self.list_fo_underlyings()
 
     def resolve_yf(self, symbol: str) -> str:
         """Return Yahoo Finance ticker for a symbol."""
