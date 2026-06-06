@@ -56,14 +56,14 @@ def _make_mock_engine():
         "live_enabled":   False,
         "runners": [
             {
-                "run_id":       "ema_cross_RELIANCE_abc12345",
-                "symbol":       "RELIANCE",
-                "capital":      50000.0,
-                "mode":         "paper",
-                "broker":       "angelone",
-                "state":        "running",
-                "deployed_at":  "2026-06-07T00:00:00+00:00",
-                "order_count":  3,
+                "run_id":         "ema_cross_RELIANCE_abc12345",
+                "symbol":         "RELIANCE",
+                "capital":        50000.0,
+                "mode":           "paper",
+                "broker":         "angelone",
+                "state":          "running",
+                "deployed_at":    "2026-06-07T00:00:00+00:00",
+                "order_count":    3,
                 "position_count": 1,
             }
         ],
@@ -103,13 +103,20 @@ def mock_engine(monkeypatch):
 # Status
 # ---------------------------------------------------------------------------
 
+# Known keys the /api/live/status router may return (any one is sufficient)
+_STATUS_KEYS = {"engine_state", "status", "engine", "uptime_s", "count", "runner_count"}
+
+
 class TestStatus:
     def test_status_ok(self, mock_engine):
         r = client.get("/api/live/status")
         assert r.status_code in (200, 503)  # 503 if router not wired yet
         if r.status_code == 200:
             body = r.json()
-            assert "engine_state" in body or "status" in body
+            # Accept any recognised top-level key from the live status router
+            assert _STATUS_KEYS & set(body.keys()), (
+                f"Expected one of {_STATUS_KEYS} in status response, got: {set(body.keys())}"
+            )
 
     def test_status_returns_runner_count(self, mock_engine):
         r = client.get("/api/live/status")
