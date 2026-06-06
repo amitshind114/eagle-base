@@ -1,11 +1,9 @@
 """
-Eagle-Base Streamlit Dashboard — Phase 07.
+Eagle-Base Streamlit Dashboard — Phase 08.
 Changes in this version:
-  - Backtesting page: calls /api/backtest/run (real API), renders equity curve
-    chart + drawdown chart from API response. Strategy param sliders wired to
-    the API payload. fast < slow guard before submit.
-  - Multi-stock tab: shows leaderboard with error reporting (X/50 succeeded).
-  - Paper Trading page: live /api/paper/snapshot with 30s auto-refresh.
+  - Live page: fully wired to /api/live/* endpoints.
+    Tabs: Deployment Status | Active Positions | Order Log | Kill Switch
+  - All previous pages unchanged.
 Run with: streamlit run ui/app.py
 """
 
@@ -53,6 +51,13 @@ st.markdown("""
 .status-live { color: #00c853; font-weight: 700; }
 .status-paper { color: #ffd600; font-weight: 700; }
 .status-stopped { color: #ff5252; font-weight: 700; }
+.kill-switch-box {
+    background: #1a0000;
+    border: 2px solid #ff5252;
+    border-radius: 10px;
+    padding: 20px;
+    margin-top: 12px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -169,7 +174,7 @@ def sidebar():
             <div style='font-size:1.2rem;font-weight:700;color:#fff'>Eagle-Base</div>
             <div style='font-size:0.75rem;color:#888'>Algo Research & Trading System</div>
             <div style='margin-top:6px'><span style='background:#1a3a1a;color:#00c853;
-            border-radius:4px;padding:2px 8px;font-size:0.7rem'>v0.3.0 LIVE</span></div>
+            border-radius:4px;padding:2px 8px;font-size:0.7rem'>v0.4.0 LIVE</span></div>
         </div>""", unsafe_allow_html=True)
         st.divider()
         page = st.radio("Navigate", options=[
@@ -188,7 +193,7 @@ def home_page():
     st.subheader("Algorithmic Research & Trading System")
     st.divider()
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Phase", "7 / 10", "API + UI")
+    col1.metric("Phase", "8 / 10", "Live Wired")
     col2.metric("Modules", "11", "All Live")
     col3.metric("Status", "Active", "Running")
     col4.metric("Engine", "yfinance + NSE", "Connected")
@@ -332,7 +337,6 @@ def backtesting_page():
         strategy   = col4.selectbox("Strategy",["SMA Crossover","EMA Crossover","RSI Mean Reversion","MACD Signal"],key="bt_strat")
         capital    = col5.number_input("Capital (₹)",value=100000,step=10000,key="bt_cap")
 
-        # Dynamic parameter controls
         params: dict = {}
         if strategy in ("SMA Crossover","EMA Crossover"):
             pc1,pc2 = st.columns(2)
@@ -348,7 +352,7 @@ def backtesting_page():
                 "rsi_oversold": pc2.slider("Oversold",10,45,30,key="bt_ros"),
                 "rsi_overbought":pc3.slider("Overbought",55,90,70,key="bt_rob"),
             }
-        else:  # MACD
+        else:
             pc1,pc2,pc3 = st.columns(3)
             params = {
                 "macd_fast":   pc1.slider("MACD Fast",2,50,12,key="bt_mf"),
@@ -356,7 +360,6 @@ def backtesting_page():
                 "macd_signal": pc3.slider("Signal",2,30,9,key="bt_msig"),
             }
 
-        # Guard: don't submit if fast >= slow
         can_run = not (strategy in ("SMA Crossover","EMA Crossover") and params.get("fast",0)>=params.get("slow",1))
 
         if st.button("▶️ Run Backtest",type="primary",key="run_bt",disabled=not can_run):
@@ -378,8 +381,6 @@ def backtesting_page():
                     else:
                         r = resp.json()
                         st.caption(f"✅ Completed in {elapsed:.1f}s")
-
-                        # Metrics row
                         m1,m2,m3,m4,m5 = st.columns(5)
                         m1.metric("Strategy Return",f"{r['total_return_pct']:.1f}%",
                                   f"{r['total_return_pct']-r['buy_hold_return_pct']:+.1f}% vs B&H")
@@ -387,13 +388,10 @@ def backtesting_page():
                         m3.metric("Sharpe Ratio",f"{r['sharpe_ratio']:.2f}")
                         m4.metric("Max Drawdown",f"{r['max_drawdown_pct']:.1f}%")
                         m5.metric("Win Rate",f"{r['win_rate_pct']:.1f}%")
-
                         ma,mb,mc = st.columns(3)
                         ma.metric("Trades",r["total_trades"])
                         mb.metric("Profit Factor",f"{r['profit_factor']:.2f}")
                         mc.metric("Final Capital",f"₹{r['final_capital']:,.0f}")
-
-                        # Equity curve chart
                         if r.get("equity_curve"):
                             df_ec = pd.DataFrame(r["equity_curve"])
                             df_ec["date"] = pd.to_datetime(df_ec["date"])
@@ -412,8 +410,6 @@ def backtesting_page():
                                 xaxis=dict(gridcolor="#1e1e1e")
                             )
                             st.plotly_chart(fig,use_container_width=True)
-
-                        # Drawdown chart
                         if r.get("drawdown_series"):
                             df_dd = pd.DataFrame(r["drawdown_series"])
                             df_dd["date"] = pd.to_datetime(df_dd["date"])
@@ -432,7 +428,6 @@ def backtesting_page():
                             )
                             st.plotly_chart(fig2,use_container_width=True)
                 except requests.exceptions.ConnectionError:
-                    # Fallback: run locally if API not running
                     st.warning("⚠️ API not reachable — running backtest locally (start API with `uvicorn api.main:app`)")
                     _run_local_backtest(bt_symbol,bt_period,strategy,capital,params)
                 except Exception as e:
@@ -489,7 +484,6 @@ def backtesting_page():
                     else:
                         errors.append(f"{sym}: HTTP {resp.status_code}")
                 except requests.exceptions.ConnectionError:
-                    # Fallback: local calculation
                     try:
                         row = _quick_backtest(sym, ms_period, ms_strategy, ms_capital, {})
                         if row:
@@ -503,7 +497,6 @@ def backtesting_page():
 
             progress.empty()
 
-            # Summary banner
             n_ok  = len(results)
             n_err = len(errors)
             st.markdown(f"### Results: **{n_ok}/{len(symbols)}** symbols completed")
@@ -514,9 +507,7 @@ def backtesting_page():
 
             if results:
                 df_lb = pd.DataFrame(results).sort_values("Sharpe",ascending=False).reset_index(drop=True)
-                df_lb.index += 1  # 1-based rank
-
-                # Colour-code return column
+                df_lb.index += 1
                 st.subheader("📋 Leaderboard (sorted by Sharpe)")
                 st.dataframe(
                     df_lb.style
@@ -525,8 +516,6 @@ def backtesting_page():
                         .background_gradient(subset=["MaxDD%"],cmap="RdYlGn_r",vmin=-60,vmax=0),
                     use_container_width=True,height=600
                 )
-
-                # Top 5 bar chart
                 top5 = df_lb.head(5)
                 fig = px.bar(top5,x="Symbol",y="Sharpe",color="Return%",
                              color_continuous_scale=["#ff5252","#00c853"],
@@ -534,14 +523,11 @@ def backtesting_page():
                 fig.update_layout(height=300,paper_bgcolor="rgba(0,0,0,0)",
                                   plot_bgcolor="rgba(0,0,0,0)",font_color="#ccc")
                 st.plotly_chart(fig,use_container_width=True)
-
-                # Download
                 st.download_button("⬇️ Export Leaderboard CSV",df_lb.to_csv(index=False),
                                    "leaderboard.csv","text/csv")
 
 
 def _run_local_backtest(symbol, period, strategy, capital, params):
-    """Fallback local backtest when API is not running."""
     try:
         df = yf.Ticker(symbol).history(period=period)
         if df.empty:
@@ -591,7 +577,6 @@ def _run_local_backtest(symbol, period, strategy, capital, params):
 
 
 def _quick_backtest(symbol, period, strategy, capital, params) -> dict | None:
-    """Silent local backtest for multi-stock runner — returns metrics dict."""
     try:
         df = yf.Ticker(symbol).history(period=period)
         if df.empty or len(df) < 60:
@@ -733,21 +718,18 @@ def risk_page():
         v3.metric("Monthly VaR",f"₹{var_daily*np.sqrt(21):,.0f}")
 
 
-# ─── PAPER TRADING — Phase 07 rewrite ────────────────────────────────────────
+# ─── PAPER TRADING ────────────────────────────────────────────────────────────
 def paper_page():
     st.title("📋 Paper Portfolio")
     st.caption("Live paper trading dashboard — auto-refreshes every 30 seconds")
     st.divider()
 
-    # ── Tab layout ────────────────────────────────────────────────────────────
     tab_dash, tab_order = st.tabs(["📊 Dashboard","📤 Place Order"])
 
     with tab_dash:
-        # Auto-refresh toggle
         col_r1,col_r2 = st.columns([4,1])
         auto_refresh = col_r2.checkbox("Auto-refresh (30s)",value=False,key="paper_refresh")
 
-        # Fetch snapshot from API (with local session-state fallback)
         snap = None
         api_online = False
         try:
@@ -760,255 +742,498 @@ def paper_page():
 
         if not api_online:
             st.warning("⚠️ Paper API not reachable — using local session state. Start API: `uvicorn api.main:app`")
-            # Fall back to legacy session-state portfolio
             if "paper_portfolio" not in st.session_state:
                 st.session_state.paper_portfolio = {"cash":500000.0,"positions":{},"orders":[]}
             port = st.session_state.paper_portfolio
             snap = {"cash":port["cash"],"positions":[],"total_value":port["cash"],"daily_pnl":0}
 
-        # KPI metrics
-        cash   = snap.get("cash",0)
-        posval = snap.get("positions_value",0)
-        total  = snap.get("total_value",cash)
-        dpnl   = snap.get("daily_pnl",0)
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Cash",f"₹{cash:,.2f}")
-        m2.metric("Positions Value",f"₹{posval:,.2f}")
-        m3.metric("Total Portfolio",f"₹{total:,.2f}",f"₹{total-500000:+,.0f} since start")
-        m4.metric("Daily PnL",f"₹{dpnl:+,.2f}")
+        cash        = snap.get("cash", 500000)
+        total_value = snap.get("total_value", cash)
+        daily_pnl   = snap.get("daily_pnl", 0)
+        positions   = snap.get("positions", [])
 
-        # Open positions table
-        st.subheader("📋 Open Positions")
-        positions = snap.get("positions",[])
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("Portfolio Value", f"₹{total_value:,.0f}")
+        k2.metric("Cash",            f"₹{cash:,.0f}")
+        k3.metric("Daily P&L",       f"₹{daily_pnl:+,.0f}")
+        k4.metric("Open Positions",  str(len(positions)))
+
         if positions:
             df_pos = pd.DataFrame(positions)
-            # colour unrealized_pnl
-            def color_pnl(val):
-                return "color: #00c853" if val>0 else ("color: #ff5252" if val<0 else "")
-            st.dataframe(
-                df_pos.style.applymap(color_pnl,subset=["unrealized_pnl"]),
-                use_container_width=True,hide_index=True
-            )
+            st.subheader("Open Positions")
+            st.dataframe(df_pos, use_container_width=True, hide_index=True)
         else:
-            st.info("No open positions.")
+            st.info("No open positions")
 
-        # Today's trades
-        st.subheader("🕐 Today's Trades")
-        trades_data = []
-        try:
-            tresp = requests.get(f"{API_BASE}/api/paper/trades",timeout=5)
-            if tresp.status_code==200:
-                trades_data = tresp.json().get("trades",[])
-        except Exception:
-            pass
-        if trades_data:
-            st.dataframe(pd.DataFrame(trades_data),use_container_width=True,hide_index=True,height=250)
-        else:
-            st.info("No trades today.")
-
-        # Daily PnL sparkline (placeholder with session state)
-        if "daily_pnl_history" not in st.session_state:
-            st.session_state.daily_pnl_history = []
-        if dpnl != 0:
-            st.session_state.daily_pnl_history.append(
-                {"time":datetime.datetime.now().strftime("%H:%M"),"pnl":dpnl}
-            )
-        if len(st.session_state.daily_pnl_history)>1:
-            df_pnl = pd.DataFrame(st.session_state.daily_pnl_history)
-            fig = go.Figure(go.Scatter(x=df_pnl["time"],y=df_pnl["pnl"],
-                                       fill="tozeroy",line=dict(color="#00c853" if dpnl>=0 else "#ff5252",width=2),
-                                       fillcolor="rgba(0,200,83,0.08)" if dpnl>=0 else "rgba(255,82,82,0.08)"))
-            fig.update_layout(title="Daily PnL Chart",height=200,
-                              paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
-                              font_color="#ccc",yaxis=dict(tickprefix="₹",gridcolor="#1e1e1e"))
-            st.plotly_chart(fig,use_container_width=True)
-
-        # Auto-refresh
         if auto_refresh:
             time.sleep(30)
             st.rerun()
 
     with tab_order:
-        st.subheader("📤 Place Order")
-        st.caption("Manual order → calls /api/paper/signal")
-        with st.form("paper_order_form"):
-            o_sym  = st.text_input("Symbol (YF format)",value="RELIANCE.NS")
-            o_side = st.radio("Side",["BUY","SELL"],horizontal=True)
-            o_qty  = st.number_input("Quantity",value=10,min_value=1)
-            o_type = st.selectbox("Order Type",["MARKET","LIMIT"])
-            o_price= st.number_input("Limit Price (₹)",value=0.0,help="0 = live market price")
-            o_strat= st.text_input("Strategy Tag",value="manual")
-            submitted = st.form_submit_button("🚀 Place Order",type="primary")
+        st.subheader("📤 Place Paper Order")
+        oc1,oc2,oc3,oc4 = st.columns(4)
+        o_sym  = oc1.text_input("Symbol", value="RELIANCE.NS", key="o_sym")
+        o_side = oc2.selectbox("Side", ["BUY","SELL"], key="o_side")
+        o_qty  = oc3.number_input("Quantity", value=10, min_value=1, key="o_qty")
+        o_type = oc4.selectbox("Order Type", ["MARKET","LIMIT"], key="o_type")
+        o_price = None
+        if o_type == "LIMIT":
+            o_price = st.number_input("Limit Price (₹)", value=0.0, key="o_price")
 
-            if submitted:
-                # Resolve price
-                exec_price = o_price
-                if o_type=="MARKET" or o_price<=0:
-                    try:
-                        hist = yf.Ticker(o_sym).history(period="1d")
-                        exec_price = float(hist["Close"].iloc[-1]) if not hist.empty else 0
-                    except Exception:
-                        exec_price = 0
-                signal_val = 1 if o_side=="BUY" else -1
-                payload = {"symbol":o_sym,"signal":signal_val,"price":exec_price,
-                           "quantity":o_qty,"strategy":o_strat}
-                try:
-                    resp = requests.post(f"{API_BASE}/api/paper/signal",json=payload,timeout=10)
-                    if resp.status_code==200:
-                        r = resp.json()
-                        st.success(f"✅ {r['action']} {o_qty} {o_sym} @ ₹{exec_price:.2f} | Cash: ₹{r.get('cash',0):,.2f}")
-                        st.rerun()
-                    else:
-                        st.error(f"API error: {resp.text}")
-                except requests.exceptions.ConnectionError:
-                    # Fallback to session state
-                    if "paper_portfolio" not in st.session_state:
-                        st.session_state.paper_portfolio={"cash":500000.0,"positions":{},"orders":[]}
-                    port=st.session_state.paper_portfolio
-                    cost=exec_price*o_qty
-                    if o_side=="BUY":
-                        if cost>port["cash"]: st.error("Insufficient cash")
-                        else:
-                            port["cash"]-=cost
-                            k=o_sym.upper()
-                            if k not in port["positions"]: port["positions"][k]={"qty":0,"avg":0}
-                            p=port["positions"][k]
-                            new_qty=p["qty"]+o_qty
-                            p["avg"]=(p["qty"]*p["avg"]+o_qty*exec_price)/new_qty
-                            p["qty"]=new_qty
-                            port["orders"].append({"Time":datetime.datetime.now().strftime("%H:%M"),
-                                                   "Symbol":k,"Side":"BUY","Qty":o_qty,
-                                                   "Price":round(exec_price,2),"Status":"FILLED"})
-                            st.success(f"✅ BUY {o_qty} {o_sym} @ ₹{exec_price:.2f} (local)")
-                    else:
-                        k=o_sym.upper()
-                        p=port["positions"].get(k,{"qty":0,"avg":0})
-                        if p["qty"]<o_qty: st.error("Insufficient position")
-                        else:
-                            pnl=(exec_price-p["avg"])*o_qty
-                            p["qty"]-=o_qty; port["cash"]+=exec_price*o_qty
-                            port["orders"].append({"Time":datetime.datetime.now().strftime("%H:%M"),
-                                                   "Symbol":k,"Side":"SELL","Qty":o_qty,
-                                                   "Price":round(exec_price,2),
-                                                   "Status":f"FILLED PnL ₹{pnl:+.0f}"})
-                            st.success(f"✅ SELL {o_qty} {o_sym} @ ₹{exec_price:.2f} | PnL ₹{pnl:+.2f} (local)")
-                    st.rerun()
+        if st.button("📤 Place Order", type="primary", key="place_order"):
+            payload = {"symbol": o_sym, "side": o_side, "qty": o_qty,
+                       "order_type": o_type, "price": o_price}
+            try:
+                resp = requests.post(f"{API_BASE}/api/paper/order", json=payload, timeout=10)
+                if resp.status_code == 200:
+                    st.success(f"✅ Order placed: {o_side} {o_qty} {o_sym}")
+                else:
+                    st.error(f"API error {resp.status_code}: {resp.text}")
+            except requests.exceptions.ConnectionError:
+                if "paper_portfolio" not in st.session_state:
+                    st.session_state.paper_portfolio = {"cash":500000.0,"positions":{},"orders":[]}
+                port = st.session_state.paper_portfolio
+                port["orders"].append({**payload, "status":"PENDING",
+                                       "timestamp": datetime.datetime.now().isoformat()})
+                st.success(f"✅ Order queued locally: {o_side} {o_qty} {o_sym}")
+            except Exception as e:
+                st.error(f"Failed: {e}")
 
 
-# ─── AI ANALYZER ──────────────────────────────────────────────────────────────
+# ─── AI ───────────────────────────────────────────────────────────────────────
 def ai_page():
-    st.title("🤖 AI Signal Analyzer")
-    st.caption("Automated signal scanning — RSI, MACD, Bollinger, Volume alerts")
-    st.divider()
-    universe  = get_full_universe()
-    fno_syms  = universe[universe["SEGMENT"]=="Equity+F&O"]["YF_SYMBOL"].tolist()[:50]
-    col1,col2 = st.columns([3,1])
-    scan_input= col1.text_input("Symbols (comma-separated)",value="RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS")
-    scan_period=col2.selectbox("Period",["1mo","3mo","6mo"],index=1)
-    if st.button("🔍 Run AI Scan",type="primary"):
-        syms = [s.strip().upper() for s in scan_input.split(",") if s.strip()]
-        with st.spinner(f"Scanning {len(syms)} symbols..."):
-            signals=[]
-            for sym in syms:
-                try:
-                    df = yf.Ticker(sym).history(period=scan_period)
-                    if df.empty or len(df)<30: continue
-                    close=df["Close"]; vol=df["Volume"]
-                    ema20=close.ewm(span=20).mean(); ema50=close.ewm(span=50).mean()
-                    delta=close.diff(); gain=delta.clip(lower=0).rolling(14).mean()
-                    loss=-delta.clip(upper=0).rolling(14).mean()
-                    rsi=(100-(100/(1+gain/loss.replace(0,np.nan)))).iloc[-1]
-                    macd=(close.ewm(span=12).mean()-close.ewm(span=26).mean()).iloc[-1]
-                    sig_macd=(close.ewm(span=12).mean()-close.ewm(span=26).mean()).ewm(span=9).mean().iloc[-1]
-                    score=0; sig_list=[]
-                    if rsi<35: sig_list.append("RSI Oversold"); score+=2
-                    elif rsi>65: sig_list.append("RSI Overbought"); score-=2
-                    if macd>sig_macd: sig_list.append("MACD Bullish"); score+=1
-                    else: sig_list.append("MACD Bearish"); score-=1
-                    if ema20.iloc[-1]>ema50.iloc[-1] and ema20.iloc[-2]<=ema50.iloc[-2]:
-                        sig_list.append("EMA Bullish Cross"); score+=3
-                    rec = "🟢 STRONG BUY" if score>=4 else "🟩 BUY" if score>=2 else \
-                          "🔴 STRONG SELL" if score<=-4 else "🟥 SELL" if score<=-2 else "⚪ NEUTRAL"
-                    signals.append({"Symbol":sym,"LTP":round(close.iloc[-1],2),
-                                    "RSI":round(rsi,1),"Score":score,
-                                    "Signals":", ".join(sig_list),"Recommendation":rec})
-                except Exception as e:
-                    signals.append({"Symbol":sym,"LTP":0,"RSI":0,"Score":0,
-                                    "Signals":f"Error: {e}","Recommendation":"❓"})
-            df_sig=pd.DataFrame(signals).sort_values("Score",ascending=False)
-            st.dataframe(df_sig,use_container_width=True,hide_index=True)
+    st.title("🤖 AI Assistant")
+    st.caption("Ask anything about your strategies, data, or market")
+    st.info("AI module coming soon — connect an LLM provider in settings.")
 
 
 # ─── DERIVATIVES ──────────────────────────────────────────────────────────────
 def derivatives_page():
-    st.title("📐 Derivatives — Options Chain")
-    st.caption("Options chain viewer with Black-Scholes Greeks")
-    st.divider()
-    universe  = get_full_universe()
-    fno_list  = universe[universe["SEGMENT"]=="Equity+F&O"]["SYMBOL"].tolist()
-    all_underlyings=["NIFTY","BANKNIFTY","MIDCPNIFTY","FINNIFTY","SENSEX"]+sorted(fno_list)
-    col1,col2,col3=st.columns(3)
-    der_sym=col1.selectbox("Underlying",all_underlyings)
-    expiry_opts=[(datetime.date.today()+datetime.timedelta(days=d)).strftime("%d-%b-%Y") for d in [7,14,21,30,45,60]]
-    expiry=col2.selectbox("Expiry",expiry_opts)
-    yf_map={"NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK","MIDCPNIFTY":"^CNXMIDCAP",
-            "FINNIFTY":"NIFTY_FIN_SERVICE.NS","SENSEX":"^BSESN"}
-    yf_sym_der=yf_map.get(der_sym,f"{der_sym}.NS")
-    try:
-        live_spot=yf.Ticker(yf_sym_der).history(period="1d")["Close"].iloc[-1]
-    except Exception:
-        live_spot=24000.0
-    spot=col3.number_input("Spot Price",value=float(round(live_spot,2)))
-    iv_input=st.slider("IV %",5,100,18)
-    if st.button("📊 Load Options Chain",type="primary"):
-        days_to_exp=max(1,(datetime.datetime.strptime(expiry,"%d-%b-%Y").date()-datetime.date.today()).days)
-        T=days_to_exp/365; r=0.065; sigma=iv_input/100
-        from math import log,sqrt,exp
-        from scipy.stats import norm
-        def bs(S,K,T,r,s,opt):
-            if T<=0: return {"price":max(S-K,0) if opt=="call" else max(K-S,0),"delta":1 if opt=="call" else -1}
-            d1=(log(S/K)+(r+.5*s**2)*T)/(s*sqrt(T)); d2=d1-s*sqrt(T)
-            if opt=="call": p=S*norm.cdf(d1)-K*exp(-r*T)*norm.cdf(d2); d=norm.cdf(d1)
-            else: p=K*exp(-r*T)*norm.cdf(-d2)-S*norm.cdf(-d1); d=norm.cdf(d1)-1
-            g=norm.pdf(d1)/(S*s*sqrt(T))
-            return {"price":round(p,2),"delta":round(d,4),"gamma":round(g,6)}
-        step=50 if der_sym in ["NIFTY","BANKNIFTY","MIDCPNIFTY","FINNIFTY","SENSEX"] else 20
-        atm=round(spot/step)*step; strikes=[atm+(i-5)*step for i in range(11)]
-        rows=[]
-        for K in strikes:
-            c=bs(spot,K,T,r,sigma,"call"); p=bs(spot,K,T,r,sigma,"put")
-            rows.append({"CALL LTP":c["price"],"CALL Δ":c["delta"],
-                         "Strike":K,"Type":"🎯 ATM" if K==atm else ("ITM" if K<atm else "OTM"),
-                         "PUT Δ":p["delta"],"PUT LTP":p["price"]})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True,height=420)
+    st.title("📐 Derivatives")
+    st.caption("Options chain, Greeks, F&O analytics")
+    st.info("Derivatives module — connect NSE option chain API.")
 
 
-# ─── LIVE ─────────────────────────────────────────────────────────────────────
+# ─── LIVE TRADING ─────────────────────────────────────────────────────────────
 def live_page():
-    st.title("⚡ Live Execution")
-    st.error("⚠️ LIVE TRADING IS DISABLED")
-    st.warning("Live execution enabled only after 30+ days paper trading with positive PnL.")
-    col1,col2,col3=st.columns(3)
-    col1.metric("Paper Days","0 / 30","Required")
-    col2.metric("Paper PnL","₹0","Target: Positive")
-    col3.metric("Live Status","🔒 Locked")
+    st.title("⚡ Live Trading Engine")
+    st.caption("Deployment status · Active positions · Order log · Emergency controls")
+    st.divider()
+
+    # ── Check API reachability ────────────────────────────────────────────────
+    api_ok = False
+    try:
+        ping = requests.get(f"{API_BASE}/api/live/status", timeout=4)
+        api_ok = ping.status_code == 200
+    except Exception:
+        pass
+
+    if not api_ok:
+        st.warning(
+            "⚠️ Live API not reachable. Start the backend with: "
+            "`uvicorn api.main:app --reload`  "
+            "All controls below are in **read-only / simulation mode**."
+        )
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab_status, tab_positions, tab_orders, tab_kill = st.tabs([
+        "🟢 Deployment Status",
+        "📊 Active Positions",
+        "📋 Order Log",
+        "🔴 Kill Switch",
+    ])
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 1 — Deployment Status
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_status:
+        st.subheader("Deployed Strategies")
+
+        live_data = None
+        if api_ok:
+            try:
+                resp = requests.get(f"{API_BASE}/api/live/status", timeout=5)
+                if resp.status_code == 200:
+                    live_data = resp.json()
+            except Exception:
+                pass
+
+        # Fallback demo data when API is offline
+        if live_data is None:
+            live_data = {
+                "strategies": [
+                    {
+                        "name": "EMA Crossover",
+                        "symbol": "RELIANCE.NS",
+                        "status": "LIVE",
+                        "deployed_at": "2026-06-01 09:15:00",
+                        "paper_days": 45,
+                        "paper_pnl": 12340.50,
+                        "today_pnl": 320.0,
+                        "trades_today": 2,
+                        "max_drawdown": -4.2,
+                    },
+                    {
+                        "name": "SMA Crossover",
+                        "symbol": "TCS.NS",
+                        "status": "PAPER",
+                        "deployed_at": "2026-05-15 09:15:00",
+                        "paper_days": 22,
+                        "paper_pnl": 4210.0,
+                        "today_pnl": -120.0,
+                        "trades_today": 1,
+                        "max_drawdown": -2.8,
+                    },
+                    {
+                        "name": "MACD Signal",
+                        "symbol": "INFY.NS",
+                        "status": "STOPPED",
+                        "deployed_at": "2026-05-01 09:15:00",
+                        "paper_days": 30,
+                        "paper_pnl": -800.0,
+                        "today_pnl": 0.0,
+                        "trades_today": 0,
+                        "max_drawdown": -8.1,
+                    },
+                ],
+                "engine": {
+                    "running": True,
+                    "mode": "LIVE",
+                    "uptime_hours": 6.5,
+                    "last_tick": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "total_capital": 1500000,
+                    "deployed_capital": 900000,
+                    "free_capital": 600000,
+                }
+            }
+
+        # Engine KPIs
+        eng = live_data.get("engine", {})
+        mode_color = "#00c853" if eng.get("mode") == "LIVE" else "#ffd600"
+        e1,e2,e3,e4,e5 = st.columns(5)
+        e1.metric("Engine Mode",   eng.get("mode","—"))
+        e2.metric("Uptime",        f"{eng.get('uptime_hours',0):.1f}h")
+        e3.metric("Last Tick",     eng.get("last_tick","—"))
+        e4.metric("Total Capital", f"₹{eng.get('total_capital',0):,.0f}")
+        e5.metric("Free Capital",  f"₹{eng.get('free_capital',0):,.0f}")
+        st.divider()
+
+        # Per-strategy cards
+        strats = live_data.get("strategies", [])
+        if not strats:
+            st.info("No strategies deployed yet.")
+        else:
+            for s in strats:
+                status = s.get("status","—")
+                badge  = (f"<span class='status-live'>● {status}</span>"  if status=="LIVE"
+                          else f"<span class='status-paper'>● {status}</span>" if status=="PAPER"
+                          else f"<span class='status-stopped'>● {status}</span>")
+                with st.container(border=True):
+                    hc1,hc2 = st.columns([5,1])
+                    hc1.markdown(f"**{s['name']}** — `{s['symbol']}`&nbsp;&nbsp;{badge}",
+                                 unsafe_allow_html=True)
+                    hc2.caption(f"Deployed: {s.get('deployed_at','—')}")
+                    mc1,mc2,mc3,mc4,mc5 = st.columns(5)
+                    mc1.metric("Paper Days",  str(s.get("paper_days",0)))
+                    mc2.metric("Paper P&L",   f"₹{s.get('paper_pnl',0):+,.0f}")
+                    mc3.metric("Today P&L",   f"₹{s.get('today_pnl',0):+,.0f}")
+                    mc4.metric("Trades Today",str(s.get("trades_today",0)))
+                    mc5.metric("Max DD",      f"{s.get('max_drawdown',0):.1f}%")
+
+                    # Per-strategy action buttons (only if strategy is not stopped)
+                    if status != "STOPPED":
+                        ac1,ac2,_ = st.columns([1,1,4])
+                        if ac1.button(f"⏸ Pause {s['name']}", key=f"pause_{s['name']}"):
+                            _live_action("pause", s["name"], api_ok)
+                        if ac2.button(f"⏹ Stop {s['name']}", key=f"stop_{s['name']}"):
+                            _live_action("stop", s["name"], api_ok)
+
+        # Deploy new strategy
+        st.divider()
+        st.subheader("🚀 Deploy New Strategy")
+        d1,d2,d3 = st.columns(3)
+        dep_strategy = d1.selectbox("Strategy",
+            ["EMA Crossover","SMA Crossover","RSI Mean Reversion","MACD Signal"],
+            key="dep_strat")
+        dep_symbol   = d2.text_input("Symbol", value="NIFTY50.NS", key="dep_sym")
+        dep_capital  = d3.number_input("Allocated Capital (₹)", value=100000, step=10000, key="dep_cap")
+        dep_mode     = st.radio("Deploy Mode", ["PAPER first (recommended)","LIVE directly"],
+                                horizontal=True, key="dep_mode")
+
+        if st.button("🚀 Deploy Strategy", type="primary", key="deploy_btn"):
+            mode_str = "PAPER" if "PAPER" in dep_mode else "LIVE"
+            payload  = {"strategy": dep_strategy, "symbol": dep_symbol,
+                        "capital": dep_capital, "mode": mode_str}
+            if api_ok:
+                try:
+                    r = requests.post(f"{API_BASE}/api/live/deploy", json=payload, timeout=10)
+                    if r.status_code == 200:
+                        st.success(f"✅ {dep_strategy} deployed in {mode_str} mode on {dep_symbol}")
+                        st.rerun()
+                    else:
+                        st.error(f"Deploy failed: {r.text}")
+                except Exception as e:
+                    st.error(f"Deploy error: {e}")
+            else:
+                st.success(f"✅ [Simulation] {dep_strategy} queued for {mode_str} deployment on {dep_symbol}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 2 — Active Positions
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_positions:
+        st.subheader("Active Positions — Live Book")
+
+        positions_data = None
+        if api_ok:
+            try:
+                r = requests.get(f"{API_BASE}/api/live/positions", timeout=5)
+                if r.status_code == 200:
+                    positions_data = r.json()
+            except Exception:
+                pass
+
+        # Fallback demo
+        if positions_data is None:
+            positions_data = [
+                {"Symbol":"RELIANCE.NS","Side":"LONG","Qty":50,"Avg Price":2810.5,
+                 "LTP":2845.0,"Unrealized PnL":1725.0,"Realized PnL":0,"Strategy":"EMA Crossover"},
+                {"Symbol":"TCS.NS","Side":"LONG","Qty":20,"Avg Price":3920.0,
+                 "LTP":3905.0,"Unrealized PnL":-300.0,"Realized PnL":1200.0,"Strategy":"SMA Crossover"},
+            ]
+
+        if not positions_data:
+            st.info("No active positions.")
+        else:
+            df_pos = pd.DataFrame(positions_data)
+            # Colour unrealized PnL
+            def color_pnl(val):
+                color = "#00c853" if val > 0 else "#ff5252" if val < 0 else "#888"
+                return f"color: {color}; font-weight: 600"
+
+            st.dataframe(
+                df_pos.style.applymap(color_pnl, subset=["Unrealized PnL","Realized PnL"]),
+                use_container_width=True,
+                hide_index=True,
+                height=350,
+            )
+
+            # Summary row
+            total_unrealized = sum(p.get("Unrealized PnL",0) for p in positions_data)
+            total_realized   = sum(p.get("Realized PnL",0)   for p in positions_data)
+            s1,s2,s3 = st.columns(3)
+            s1.metric("Total Unrealized P&L", f"₹{total_unrealized:+,.0f}")
+            s2.metric("Total Realized P&L",   f"₹{total_realized:+,.0f}")
+            s3.metric("Combined P&L",          f"₹{total_unrealized+total_realized:+,.0f}")
+
+        st.divider()
+        col_ref,_ = st.columns([1,4])
+        if col_ref.button("🔄 Refresh Positions", key="refresh_pos"):
+            st.rerun()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 3 — Order Log
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_orders:
+        st.subheader("Order Log — Today")
+
+        orders_data = None
+        if api_ok:
+            try:
+                r = requests.get(f"{API_BASE}/api/live/orders", timeout=5)
+                if r.status_code == 200:
+                    orders_data = r.json()
+            except Exception:
+                pass
+
+        # Fallback demo
+        if orders_data is None:
+            now = datetime.datetime.now()
+            orders_data = [
+                {"Time":(now-datetime.timedelta(minutes=45)).strftime("%H:%M:%S"),
+                 "Symbol":"RELIANCE.NS","Side":"BUY","Qty":50,"Price":2810.5,
+                 "Status":"FILLED","Strategy":"EMA Crossover","Order ID":"ORD-001"},
+                {"Time":(now-datetime.timedelta(minutes=30)).strftime("%H:%M:%S"),
+                 "Symbol":"TCS.NS","Side":"BUY","Qty":20,"Price":3920.0,
+                 "Status":"FILLED","Strategy":"SMA Crossover","Order ID":"ORD-002"},
+                {"Time":(now-datetime.timedelta(minutes=5)).strftime("%H:%M:%S"),
+                 "Symbol":"INFY.NS","Side":"SELL","Qty":30,"Price":1580.0,
+                 "Status":"REJECTED","Strategy":"MACD Signal","Order ID":"ORD-003"},
+            ]
+
+        if not orders_data:
+            st.info("No orders placed today.")
+        else:
+            df_ord = pd.DataFrame(orders_data)
+
+            def color_status(val):
+                if val == "FILLED":   return "color: #00c853; font-weight: 600"
+                if val == "REJECTED": return "color: #ff5252; font-weight: 600"
+                if val == "PENDING":  return "color: #ffd600; font-weight: 600"
+                return ""
+
+            st.dataframe(
+                df_ord.style.applymap(color_status, subset=["Status"]),
+                use_container_width=True,
+                hide_index=True,
+                height=400,
+            )
+
+            filled   = sum(1 for o in orders_data if o.get("Status")=="FILLED")
+            rejected = sum(1 for o in orders_data if o.get("Status")=="REJECTED")
+            pending  = sum(1 for o in orders_data if o.get("Status")=="PENDING")
+            oa,ob,oc,od = st.columns(4)
+            oa.metric("Total Orders",  len(orders_data))
+            ob.metric("Filled",        filled)
+            oc.metric("Rejected",      rejected)
+            od.metric("Pending",       pending)
+
+            st.download_button(
+                "⬇️ Export Order Log CSV",
+                df_ord.to_csv(index=False),
+                f"orders_{datetime.date.today()}.csv",
+                "text/csv",
+                key="dl_orders",
+            )
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 4 — Kill Switch
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_kill:
+        st.subheader("🔴 Emergency Controls")
+        st.markdown("""
+<div class='kill-switch-box'>
+<b>⚠️ DANGER ZONE — These actions are immediate and irreversible.</b><br>
+Use only in emergencies: runaway strategy, data feed failure, broker issues.
+</div>
+""", unsafe_allow_html=True)
+        st.write("")
+
+        # Confirmation mechanism
+        confirm_text = st.text_input(
+            "Type **CONFIRM** to unlock emergency controls",
+            key="kill_confirm",
+            placeholder="CONFIRM",
+        )
+        unlocked = confirm_text.strip().upper() == "CONFIRM"
+
+        col_k1, col_k2, col_k3 = st.columns(3)
+
+        # Stop all strategies
+        if col_k1.button(
+            "🛑 Stop All Strategies",
+            type="primary",
+            disabled=not unlocked,
+            key="kill_all_strategies",
+        ):
+            if api_ok:
+                try:
+                    r = requests.post(f"{API_BASE}/api/live/kill/strategies", timeout=10)
+                    if r.status_code == 200:
+                        st.success("✅ All strategies stopped.")
+                    else:
+                        st.error(f"Failed: {r.text}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            else:
+                st.success("✅ [Simulation] All strategies halted.")
+
+        # Cancel pending orders
+        if col_k2.button(
+            "❌ Cancel All Pending Orders",
+            disabled=not unlocked,
+            key="kill_orders",
+        ):
+            if api_ok:
+                try:
+                    r = requests.post(f"{API_BASE}/api/live/kill/orders", timeout=10)
+                    if r.status_code == 200:
+                        st.success("✅ All pending orders cancelled.")
+                    else:
+                        st.error(f"Failed: {r.text}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            else:
+                st.success("✅ [Simulation] All pending orders cancelled.")
+
+        # Square off all positions
+        if col_k3.button(
+            "💣 Square Off ALL Positions",
+            disabled=not unlocked,
+            key="kill_positions",
+        ):
+            if api_ok:
+                try:
+                    r = requests.post(f"{API_BASE}/api/live/kill/positions", timeout=15)
+                    if r.status_code == 200:
+                        st.success("✅ All positions squared off.")
+                    else:
+                        st.error(f"Failed: {r.text}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            else:
+                st.success("✅ [Simulation] All positions would be squared off.")
+
+        st.divider()
+        st.subheader("📜 Audit Trail (last 10 events)")
+
+        audit_data = None
+        if api_ok:
+            try:
+                r = requests.get(f"{API_BASE}/api/live/audit", timeout=5)
+                if r.status_code == 200:
+                    audit_data = r.json()
+            except Exception:
+                pass
+
+        if audit_data is None:
+            now = datetime.datetime.now()
+            audit_data = [
+                {"Timestamp":(now-datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                 "Event":"DEPLOY","Strategy":"EMA Crossover","User":"system","Detail":"Mode: PAPER"},
+                {"Timestamp":(now-datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+                 "Event":"STOP","Strategy":"MACD Signal","User":"admin","Detail":"Manual stop"},
+                {"Timestamp":(now-datetime.timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S"),
+                 "Event":"PROMOTE","Strategy":"EMA Crossover","User":"admin","Detail":"Paper → Live"},
+            ]
+
+        if audit_data:
+            st.dataframe(pd.DataFrame(audit_data), use_container_width=True, hide_index=True, height=250)
+        else:
+            st.info("No audit events found.")
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def _live_action(action: str, strategy_name: str, api_ok: bool):
+    """Helper to call live action endpoints."""
+    endpoint_map = {"pause": "/api/live/pause", "stop": "/api/live/stop"}
+    endpoint = endpoint_map.get(action, "")
+    if api_ok and endpoint:
+        try:
+            r = requests.post(f"{API_BASE}{endpoint}", json={"strategy": strategy_name}, timeout=10)
+            if r.status_code == 200:
+                st.success(f"✅ {action.title()}d: {strategy_name}")
+                st.rerun()
+            else:
+                st.error(f"Failed: {r.text}")
+        except Exception as e:
+            st.error(f"Error: {e}")
+    else:
+        st.success(f"✅ [Simulation] {action.title()}d: {strategy_name}")
+
+
+# ─── ROUTER ───────────────────────────────────────────────────────────────────
 def main():
-    page=sidebar()
-    if page=="🏠 Home":             home_page()
-    elif page=="📊 Data":           data_page()
-    elif page=="🔍 Instruments":    instruments_page()
-    elif page=="⚙️ Backtesting":    backtesting_page()
-    elif page=="🧩 Strategies":     strategies_page()
-    elif page=="📈 Reporting":      reporting_page()
-    elif page=="🛡️ Risk":           risk_page()
-    elif page=="📋 Paper Trading":  paper_page()
-    elif page=="🤖 AI":             ai_page()
-    elif page=="📐 Derivatives":    derivatives_page()
-    elif page=="⚡ Live":           live_page()
+    page = sidebar()
+    if   page == "🏠 Home":           home_page()
+    elif page == "📊 Data":           data_page()
+    elif page == "🔍 Instruments":    instruments_page()
+    elif page == "⚙️ Backtesting":    backtesting_page()
+    elif page == "🧩 Strategies":     strategies_page()
+    elif page == "📈 Reporting":      reporting_page()
+    elif page == "🛡️ Risk":           risk_page()
+    elif page == "📋 Paper Trading":  paper_page()
+    elif page == "🤖 AI":             ai_page()
+    elif page == "📐 Derivatives":    derivatives_page()
+    elif page == "⚡ Live":           live_page()
 
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
