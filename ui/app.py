@@ -248,7 +248,7 @@ def data_page():
         if seg_f != "All": filtered = filtered[filtered["SEGMENT"]==seg_f]
         if exc_f != "All": filtered = filtered[filtered["EXCHANGE"]==exc_f]
         st.dataframe(filtered[["SYMBOL","NAME","SEGMENT","EXCHANGE","YF_SYMBOL"]].head(200),
-                     use_container_width=True, hide_index=True, height=200)
+                     width='stretch', hide_index=True, height=200)
         c2a,c2b,c2c = st.columns(3)
         selected_yf = c2a.text_input("Selected YF Symbol",value="",key="dss")
         period   = c2b.selectbox("Period",["1d","5d","1mo","3mo","6mo","1y","2y","5y"],index=4,key="dp_s")
@@ -280,8 +280,8 @@ def data_page():
                 fig.update_layout(height=450,paper_bgcolor="rgba(0,0,0,0)",
                                   plot_bgcolor="rgba(0,0,0,0)",font_color="#ccc",
                                   xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig,use_container_width=True)
-                st.dataframe(df.sort_index(ascending=False),use_container_width=True,height=300)
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(df.sort_index(ascending=False), width='stretch', height=300)
                 st.download_button("⬇️ Download CSV",df.to_csv(),f"{fetch_sym}_{period}.csv","text/csv")
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -317,7 +317,7 @@ def instruments_page():
     if exc_f != "All": filtered = filtered[filtered["EXCHANGE"]==exc_f]
     st.caption(f"**{len(filtered):,}** results matched")
     st.dataframe(filtered[["SYMBOL","NAME","SEGMENT","EXCHANGE","YF_SYMBOL"]].head(500),
-                 use_container_width=True, hide_index=True, height=350)
+                 width='stretch', hide_index=True, height=350)
 
 
 # ─── BACKTESTING — Phase 07 rewrite ──────────────────────────────────────────
@@ -409,7 +409,7 @@ def backtesting_page():
                                 yaxis=dict(tickprefix="₹",gridcolor="#1e1e1e"),
                                 xaxis=dict(gridcolor="#1e1e1e")
                             )
-                            st.plotly_chart(fig,use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True)
                         if r.get("drawdown_series"):
                             df_dd = pd.DataFrame(r["drawdown_series"])
                             df_dd["date"] = pd.to_datetime(df_dd["date"])
@@ -426,7 +426,7 @@ def backtesting_page():
                                 font_color="#ccc",yaxis=dict(ticksuffix="%",gridcolor="#1e1e1e"),
                                 xaxis=dict(gridcolor="#1e1e1e")
                             )
-                            st.plotly_chart(fig2,use_container_width=True)
+                            st.plotly_chart(fig2, use_container_width=True)
                 except requests.exceptions.ConnectionError:
                     st.warning("⚠️ API not reachable — running backtest locally (start API with `uvicorn api.main:app`)")
                     _run_local_backtest(bt_symbol,bt_period,strategy,capital,params)
@@ -514,7 +514,7 @@ def backtesting_page():
                         .background_gradient(subset=["Return%"],cmap="RdYlGn",vmin=-30,vmax=60)
                         .background_gradient(subset=["Sharpe"],cmap="RdYlGn",vmin=-1,vmax=3)
                         .background_gradient(subset=["MaxDD%"],cmap="RdYlGn_r",vmin=-60,vmax=0),
-                    use_container_width=True,height=600
+                    width='stretch', height=600
                 )
                 top5 = df_lb.head(5)
                 fig = px.bar(top5,x="Symbol",y="Sharpe",color="Return%",
@@ -522,7 +522,7 @@ def backtesting_page():
                              title="Top 5 by Sharpe Ratio")
                 fig.update_layout(height=300,paper_bgcolor="rgba(0,0,0,0)",
                                   plot_bgcolor="rgba(0,0,0,0)",font_color="#ccc")
-                st.plotly_chart(fig,use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
                 st.download_button("⬇️ Export Leaderboard CSV",df_lb.to_csv(index=False),
                                    "leaderboard.csv","text/csv")
 
@@ -571,7 +571,7 @@ def _run_local_backtest(symbol, period, strategy, capital, params):
         fig.update_layout(title="Equity Curve (local)",height=380,
                           paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
                           font_color="#ccc",yaxis=dict(tickprefix="₹",gridcolor="#1e1e1e"))
-        st.plotly_chart(fig,use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
     except Exception as e:
         st.error(f"Local backtest failed: {e}")
 
@@ -631,7 +631,7 @@ def strategies_page():
         {"Name":"MACD Signal","Type":"Momentum","Status":"Active","Params":"fast=12, slow=26, sig=9","Sharpe":1.31,"Return":"16.8%"},
     ]
     df_strat = pd.DataFrame(STRATEGIES)
-    st.dataframe(df_strat,use_container_width=True,hide_index=True)
+    st.dataframe(df_strat, width='stretch', hide_index=True)
     st.divider()
     col1,col2 = st.columns(2)
     with col1:
@@ -648,7 +648,7 @@ def strategies_page():
         fig = px.bar(df_perf,x="Name",y="Sharpe",color="Sharpe",
                      color_continuous_scale=["#ff5252","#00c853"])
         fig.update_layout(height=300,paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font_color="#ccc")
-        st.plotly_chart(fig,use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ─── REPORTING ────────────────────────────────────────────────────────────────
@@ -678,9 +678,9 @@ def reporting_page():
     with tab1:
         fig = go.Figure(go.Scatter(x=dates,y=equity,fill="tozeroy",line=dict(color="#00c853")))
         fig.update_layout(height=350,paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font_color="#ccc")
-        st.plotly_chart(fig,use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
     with tab2:
-        st.dataframe(df_trades.sort_values("Date",ascending=False),use_container_width=True,height=350)
+        st.dataframe(df_trades.sort_values("Date",ascending=False), width='stretch', height=350)
 
 
 # ─── RISK ─────────────────────────────────────────────────────────────────────
@@ -761,7 +761,7 @@ def paper_page():
         if positions:
             df_pos = pd.DataFrame(positions)
             st.subheader("Open Positions")
-            st.dataframe(df_pos, use_container_width=True, hide_index=True)
+            st.dataframe(df_pos, width='stretch', hide_index=True)
         else:
             st.info("No open positions")
 
@@ -909,7 +909,6 @@ def live_page():
 
         # Engine KPIs
         eng = live_data.get("engine", {})
-        mode_color = "#00c853" if eng.get("mode") == "LIVE" else "#ffd600"
         e1,e2,e3,e4,e5 = st.columns(5)
         e1.metric("Engine Mode",   eng.get("mode","—"))
         e2.metric("Uptime",        f"{eng.get('uptime_hours',0):.1f}h")
@@ -940,7 +939,6 @@ def live_page():
                     mc4.metric("Trades Today",str(s.get("trades_today",0)))
                     mc5.metric("Max DD",      f"{s.get('max_drawdown',0):.1f}%")
 
-                    # Per-strategy action buttons (only if strategy is not stopped)
                     if status != "STOPPED":
                         ac1,ac2,_ = st.columns([1,1,4])
                         if ac1.button(f"⏸ Pause {s['name']}", key=f"pause_{s['name']}"):
@@ -1005,19 +1003,18 @@ def live_page():
             st.info("No active positions.")
         else:
             df_pos = pd.DataFrame(positions_data)
-            # Colour unrealized PnL
+
             def color_pnl(val):
                 color = "#00c853" if val > 0 else "#ff5252" if val < 0 else "#888"
                 return f"color: {color}; font-weight: 600"
 
             st.dataframe(
-                df_pos.style.applymap(color_pnl, subset=["Unrealized PnL","Realized PnL"]),
-                use_container_width=True,
+                df_pos.style.map(color_pnl, subset=["Unrealized PnL","Realized PnL"]),
+                width='stretch',
                 hide_index=True,
                 height=350,
             )
 
-            # Summary row
             total_unrealized = sum(p.get("Unrealized PnL",0) for p in positions_data)
             total_realized   = sum(p.get("Realized PnL",0)   for p in positions_data)
             s1,s2,s3 = st.columns(3)
@@ -1072,8 +1069,8 @@ def live_page():
                 return ""
 
             st.dataframe(
-                df_ord.style.applymap(color_status, subset=["Status"]),
-                use_container_width=True,
+                df_ord.style.map(color_status, subset=["Status"]),
+                width='stretch',
                 hide_index=True,
                 height=400,
             )
@@ -1108,7 +1105,6 @@ Use only in emergencies: runaway strategy, data feed failure, broker issues.
 """, unsafe_allow_html=True)
         st.write("")
 
-        # Confirmation mechanism
         confirm_text = st.text_input(
             "Type **CONFIRM** to unlock emergency controls",
             key="kill_confirm",
@@ -1118,7 +1114,6 @@ Use only in emergencies: runaway strategy, data feed failure, broker issues.
 
         col_k1, col_k2, col_k3 = st.columns(3)
 
-        # Stop all strategies
         if col_k1.button(
             "🛑 Stop All Strategies",
             type="primary",
@@ -1137,7 +1132,6 @@ Use only in emergencies: runaway strategy, data feed failure, broker issues.
             else:
                 st.success("✅ [Simulation] All strategies halted.")
 
-        # Cancel pending orders
         if col_k2.button(
             "❌ Cancel All Pending Orders",
             disabled=not unlocked,
@@ -1155,7 +1149,6 @@ Use only in emergencies: runaway strategy, data feed failure, broker issues.
             else:
                 st.success("✅ [Simulation] All pending orders cancelled.")
 
-        # Square off all positions
         if col_k3.button(
             "💣 Square Off ALL Positions",
             disabled=not unlocked,
@@ -1197,7 +1190,7 @@ Use only in emergencies: runaway strategy, data feed failure, broker issues.
             ]
 
         if audit_data:
-            st.dataframe(pd.DataFrame(audit_data), use_container_width=True, hide_index=True, height=250)
+            st.dataframe(pd.DataFrame(audit_data), width='stretch', hide_index=True, height=250)
         else:
             st.info("No audit events found.")
 
