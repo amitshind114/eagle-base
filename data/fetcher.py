@@ -14,6 +14,11 @@ Usage:
     df = f.fetch("RELIANCE", period="5d", interval="5m")
     price = f.fetch_latest_price("NIFTY")
     info  = f.fetch_info("TCS")
+
+    # Provider-style API (used by DataManager / tests)
+    from data.fetcher import YFinanceProvider
+    p = YFinanceProvider()
+    df = p.fetch_ohlcv("AAPL", "1d", "2024-01-01", "2024-01-31")
 """
 
 from __future__ import annotations
@@ -32,7 +37,6 @@ log = get_logger("data.fetcher")
 
 # ── Valid period/interval combinations (yfinance limits) ─────────────────
 _VALID_COMBOS: dict[str, str] = {
-    # interval → max period string
     "1m":  "7d",
     "2m":  "60d",
     "3m":  "60d",
@@ -83,8 +87,6 @@ _resolver = SymbolResolver()
 class DataFetcher:
     """Fetch OHLCV data. Resolves any symbol automatically."""
 
-    # ── Primary fetch ─────────────────────────────────────────────────────
-
     def fetch(
         self,
         symbol: str,
@@ -97,11 +99,9 @@ class DataFetcher:
 
         Args:
             symbol  : NSE symbol, YF ticker, or index name.
-                      e.g. "RELIANCE", "RELIANCE.NS", "NIFTY", "BANKNIFTY"
             period  : "1d","5d","1mo","3mo","6mo","1y","2y","5y","max"
-                      Intraday auto-caps: 1m→7d, 5m/15m→60d
             interval: "1m","3m","5m","15m","30m","1h","1d","1wk","1mo"
-            min_bars: Minimum bars required (default 2, very permissive).
+            min_bars: Minimum bars required (default 2).
 
         Returns:
             DataFrame with DatetimeIndex, columns [Open,High,Low,Close,Volume].
@@ -110,14 +110,10 @@ class DataFetcher:
             DataFetchError      : Symbol not found or network error.
             InsufficientDataError: Fewer than min_bars returned.
         """
-        # Normalize inputs
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
         period   = _PERIOD_ALIASES.get(period.lower(), period)
+        period   = self._cap_period(interval, period)
 
-        # Auto-cap period for intraday intervals
-        period = self._cap_period(interval, period)
-
-        # Resolve symbol → yfinance ticker
         yf_sym = _resolver.to_yf(symbol)
         if not yf_sym:
             raise DataFetchError(
@@ -144,7 +140,6 @@ class DataFetcher:
                 f"Market may be closed or symbol delisted."
             )
 
-        # Standardise columns
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index = pd.to_datetime(df.index)
         if df.index.tz is not None:
@@ -163,25 +158,13 @@ class DataFetcher:
         log.info(f"Fetched {len(df)} bars for {yf_sym} ({interval})")
         return df
 
-    # ── Price fetch ────────────────────────────────────────────────────────
-
     def fetch_latest_price(self, symbol: str) -> float:
-        """
-        Return latest available price. Weekend/holiday safe.
-        Uses 5d window to always find the last trading session close.
-        """
+        """Return latest available price. Weekend/holiday safe."""
         return _resolver.get_price(symbol)
 
-    # ── Info fetch ─────────────────────────────────────────────────────────
-
     def fetch_info(self, symbol: str) -> dict:
-        """
-        Return instrument metadata: name, sector, price, market cap.
-        Safe: returns partial dict on failure, never raises.
-        """
+        """Return instrument metadata. Safe: returns partial dict on failure."""
         return _resolver.get_info(symbol)
-
-    # ── Batch fetch ────────────────────────────────────────────────────────
 
     def fetch_batch(
         self,
@@ -189,10 +172,7 @@ class DataFetcher:
         period: str = "1y",
         interval: str = "1d",
     ) -> dict[str, pd.DataFrame]:
-        """
-        Fetch multiple symbols in one yfinance call (much faster than loop).
-        Returns dict {symbol: DataFrame}. Skips failed symbols silently.
-        """
+        """Fetch multiple symbols in one yfinance call."""
         interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
         period   = _PERIOD_ALIASES.get(period.lower(), period)
         period   = self._cap_period(interval, period)
@@ -244,23 +224,13 @@ class DataFetcher:
         log.info(f"Batch fetch complete: {len(results)}/{len(symbols)} succeeded")
         return results
 
-    # ── Search ─────────────────────────────────────────────────────────────
-
     def search_symbols(self, query: str) -> list[dict]:
-        """
-        Search available symbols by name/prefix.
-        Returns list of {symbol, yf_symbol, display}.
-        """
+        """Search available symbols by name/prefix."""
         return _resolver.search_names(query)
-
-    # ── Helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
     def _cap_period(interval: str, period: str) -> str:
-        """
-        Enforce yfinance period limits per interval.
-        e.g. 1m data only available for last 7 days.
-        """
+        """Enforce yfinance period limits per interval."""
         caps = {
             "1m":  "7d",
             "2m":  "60d",
@@ -273,7 +243,6 @@ class DataFetcher:
             "90m": "60d",
         }
         if interval in caps:
-            # Compare requested period against cap
             order = ["1d","2d","5d","7d","1mo","3mo","6mo","60d","1y","2y","5y","max"]
             cap = caps[interval]
             try:
@@ -286,3 +255,107 @@ class DataFetcher:
             except ValueError:
                 return cap
         return period
+
+
+# ── YFinanceProvider — provider-style API used by DataManager & tests ────
+
+class YFinanceProvider:
+    """Provider-style wrapper around yfinance for use by DataManager.
+
+    Implements the interface expected by DataManager and test_data.py:
+        - name: str
+        - health_check() → dict
+        - fetch_ohlcv(symbol, interval, from_date, to_date) → DataFrame
+        - fetch_quote(symbol) → dict
+    """
+
+    name: str = "yfinance"
+
+    def health_check(self) -> dict:
+        """Return provider health status."""
+        try:
+            test = yf.Ticker("AAPL").fast_info
+            _ = test.last_price
+            return {"status": "ok", "provider": self.name}
+        except Exception as exc:
+            return {"status": "error", "provider": self.name, "error": str(exc)}
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        interval: str = "1d",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        period: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Fetch OHLCV bars for any symbol.
+
+        Args:
+            symbol    : Ticker (e.g. "AAPL", "RELIANCE.NS").
+            interval  : yfinance interval string ("1d", "1h", "5m", …).
+            from_date : ISO date string "YYYY-MM-DD" (used with to_date).
+            to_date   : ISO date string "YYYY-MM-DD".
+            period    : yfinance period string ("1mo", "1y", …).
+                        Use either period OR from_date/to_date, not both.
+
+        Returns:
+            DataFrame with DatetimeIndex, columns [Open, High, Low, Close, Volume].
+            Returns empty DataFrame on failure.
+        """
+        interval = _INTERVAL_ALIASES.get(interval.lower(), interval)
+        try:
+            ticker = yf.Ticker(symbol)
+            if from_date and to_date:
+                df = ticker.history(
+                    start=from_date,
+                    end=to_date,
+                    interval=interval,
+                    auto_adjust=True,
+                    prepost=False,
+                )
+            else:
+                p = period or "1y"
+                df = ticker.history(
+                    period=p,
+                    interval=interval,
+                    auto_adjust=True,
+                    prepost=False,
+                )
+        except Exception as exc:
+            log.error(f"YFinanceProvider.fetch_ohlcv failed for {symbol}: {exc}")
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        df = df[cols].copy()
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        df = df.dropna(subset=["Close"])
+        return df.round(2)
+
+    def fetch_quote(self, symbol: str) -> dict:
+        """
+        Return latest quote for a symbol.
+
+        Returns:
+            dict with at minimum: symbol, price, currency.
+            Returns {symbol, error} on failure.
+        """
+        try:
+            info = yf.Ticker(symbol).fast_info
+            return {
+                "symbol": symbol,
+                "price": getattr(info, "last_price", None),
+                "prev_close": getattr(info, "previous_close", None),
+                "currency": getattr(info, "currency", "INR"),
+                "exchange": getattr(info, "exchange", ""),
+            }
+        except Exception as exc:
+            log.warning(f"YFinanceProvider.fetch_quote failed for {symbol}: {exc}")
+            return {"symbol": symbol, "error": str(exc)}
