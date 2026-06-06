@@ -1,184 +1,182 @@
-"""Opening Range Breakout (ORB) Strategy — NSE Intraday.
+"""Opening Range Breakout (ORB) strategy — Phase 05 rewrite.
 
-One of the most widely used intraday strategies on NSE/BSE.
-Captures the directional breakout that often occurs when price moves
-beyond the high or low established in the first N minutes of the session.
+Opening Range Breakout logic:
+  1. Identify the opening range = first N minutes of the session.
+     Default: 15 minutes (3 x 5m bars, or 1 x 15m bar).
+  2. Range High = highest High in the opening range.
+     Range Low  = lowest  Low  in the opening range.
+  3. Signal = 1  when Close breaks ABOVE Range High (bullish breakout).
+     Signal = -1 when Close breaks BELOW Range Low  (bearish breakout).
+     Signal = 0  during the opening range period itself.
 
-Logic:
-    1. Define opening range: high and low of the first `orb_minutes` candles
-       after market open (09:15 IST by default).
-    2. BUY  signal — close of any subsequent candle breaks above range high.
-    3. SELL signal — close of any subsequent candle breaks below range low.
-    4. No new trades after `cutoff_time` (default 14:00 IST) to avoid
-       end-of-day reversals.
-    5. Stop-loss placed at the opposite end of the opening range.
-
-Requirements:
-    - Intraday OHLCV DataFrame with a DatetimeIndex in IST.
-    - Columns: Open, High, Low, Close, Volume.
-    - Typical timeframe: 1-min or 5-min candles.
+Supported intervals: 5m, 15m (intraday only).
+Required data: at least 2 full sessions of data.
 
 Usage:
-    strategy = ORBStrategy(orb_minutes=15)
-    runner   = BacktestRunner(symbol="NIFTY50", strategy=strategy, interval="5m")
-    result   = runner.run()
+    from strategies.plugins.orb import ORBStrategy
+    s = ORBStrategy(interval="5m", range_minutes=15)
+    signals = s.generate_signals(df)   # df.index must be tz-aware DatetimeIndex
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-from strategies.base import BaseStrategy, Signal
-from core.logger import logger
+from strategies.base import BaseStrategy, register_strategy
 
 
+@register_strategy
 class ORBStrategy(BaseStrategy):
-    """Opening Range Breakout — intraday breakout after initial range forms."""
+    """Opening Range Breakout for intraday (5m / 15m) data."""
 
-    name        = "orb"
+    name        = "ORB"
     version     = "1.0.0"
-    description = "Opening Range Breakout — breakout above/below first-N-minute range."
+    description = "Opening range breakout — first-N-minute high/low define the range."
+    author      = "eagle"
+    tags        = ["breakout", "intraday", "5m", "15m"]
+    parameters  = {"interval": "5m", "range_minutes": 15}
+    status      = "active"
 
-    # NSE market open in IST
-    MARKET_OPEN = "09:15"
+    # NSE session open: 09:15 IST
+    _SESSION_OPEN_HOUR   = 9
+    _SESSION_OPEN_MINUTE = 15
 
     def __init__(
         self,
-        orb_minutes: int   = 15,      # duration of opening range in minutes
-        cutoff_time: str   = "14:00", # no new entries after this time (IST)
-        stop_pct: float    = 0.005,   # 0.5% stop beyond range boundary
-        target_ratio: float = 2.0,    # risk:reward — target = stop * ratio
+        interval: str      = "5m",
+        range_minutes: int = 15,
     ) -> None:
-        self.orb_minutes  = orb_minutes
-        self.cutoff_time  = cutoff_time
-        self.stop_pct     = stop_pct
-        self.target_ratio = target_ratio
+        super().__init__()  # Phase 05: copies class-level tags/parameters to instance
+        self.interval      = interval
+        self.range_minutes = range_minutes
 
-        # State reset each trading day
-        self._range_high: float | None = None
-        self._range_low:  float | None = None
-        self._range_set:  bool         = False
-        self._traded_today: bool       = False
-        self._last_date:  str | None   = None
+    # ── helpers ──────────────────────────────────────────────────────────────
 
-    # ── Bulk signal generation (backtesting) ────────────────────────────────
+    def _bar_minutes(self) -> int:
+        """Return the interval in minutes (5 for '5m', 15 for '15m')."""
+        mapping = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30}
+        return mapping.get(self.interval, 5)
+
+    def _is_in_opening_range(self, ts: pd.Timestamp) -> bool:
+        """Return True if timestamp falls within the opening range window."""
+        session_open = ts.replace(
+            hour=self._SESSION_OPEN_HOUR,
+            minute=self._SESSION_OPEN_MINUTE,
+            second=0, microsecond=0,
+        )
+        return ts < session_open + pd.Timedelta(minutes=self.range_minutes)
+
+    def _is_session_open(self, ts: pd.Timestamp) -> bool:
+        """Return True if timestamp is at or after session open."""
+        session_open = ts.replace(
+            hour=self._SESSION_OPEN_HOUR,
+            minute=self._SESSION_OPEN_MINUTE,
+            second=0, microsecond=0,
+        )
+        return ts >= session_open
+
+    # ── core logic ───────────────────────────────────────────────────────────
+
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
-        """Vectorized ORB signals across a full intraday DataFrame."""
-        signals = pd.Series(0, index=df.index)
+        """Compute ORB signals over the entire DataFrame.
 
+        Algorithm:
+          For each bar:
+            - If in opening range window → signal = 0 (no trade during range formation)
+            - Else → look back to find the session's range High and Low
+              → compare current Close to those levels → 1 / -1 / 0
+
+        Args:
+            df: OHLCV DataFrame with tz-aware DatetimeIndex (Asia/Kolkata).
+                Required columns: Open, High, Low, Close.
+
+        Returns:
+            pd.Series of int with values in {-1, 0, 1}, same index as df.
+        """
+        if df.empty:
+            return pd.Series(0, index=df.index)
+
+        # Ensure index is DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
-            logger.warning("[orb] DataFrame index must be DatetimeIndex for ORB.")
-            return signals
+            return pd.Series(0, index=df.index)
 
-        for date, day_df in df.groupby(df.index.date):
-            # Opening range: first orb_minutes candles from 09:15
-            open_time   = pd.Timestamp(f"{date} {self.MARKET_OPEN}", tz=day_df.index.tz)
-            range_end   = open_time + pd.Timedelta(minutes=self.orb_minutes)
-            cutoff      = pd.Timestamp(f"{date} {self.cutoff_time}", tz=day_df.index.tz)
+        signals = pd.Series(0, index=df.index, dtype=int)
 
-            orb_mask    = (day_df.index >= open_time) & (day_df.index < range_end)
-            trade_mask  = (day_df.index >= range_end) & (day_df.index < cutoff)
+        # Add a date column for grouping by trading session
+        dates = df.index.normalize()  # date-only component
 
-            if orb_mask.sum() == 0:
+        for date in dates.unique():
+            session_mask = dates == date
+            session_df   = df[session_mask]
+
+            if session_df.empty:
                 continue
 
-            orb_high = day_df.loc[orb_mask, "High"].max()
-            orb_low  = day_df.loc[orb_mask, "Low"].min()
+            # Find bars inside the opening range
+            or_mask   = session_df.index.map(self._is_in_opening_range)
+            or_bars   = session_df[or_mask]
 
-            traded = False
-            for ts, row in day_df.loc[trade_mask].iterrows():
-                if traded:
-                    break
-                if row["Close"] > orb_high:
+            if or_bars.empty:
+                continue
+
+            range_high = float(or_bars["High"].max())
+            range_low  = float(or_bars["Low"].min())
+
+            # Bars AFTER the opening range — generate signals
+            post_mask = ~or_mask & session_df.index.map(self._is_session_open)
+            post_bars = session_df[post_mask]
+
+            for ts, row in post_bars.iterrows():
+                close = float(row["Close"])
+                if close > range_high:
                     signals.at[ts] = 1
-                    traded = True
-                elif row["Close"] < orb_low:
+                elif close < range_low:
                     signals.at[ts] = -1
-                    traded = True
+                # else: 0 (inside range — no signal)
 
         return signals
 
-    # ── Bar-by-bar signal (live / paper trading) ─────────────────────────────
-    def on_bar(self, df: pd.DataFrame) -> Signal:
-        """Live bar-by-bar ORB signal.
+    def on_bar(self, df: pd.DataFrame) -> int:
+        """Bar-by-bar ORB signal for live/paper trading.
 
-        Manages opening range state internally; resets each new trading day.
+        Checks if the latest bar has broken above/below today's opening range.
+        Returns 1 / -1 / 0.
         """
-        if df.empty:
-            return "HOLD"
+        if len(df) < 2:
+            return 0
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return 0
 
-        last_bar  = df.iloc[-1]
-        ts        = df.index[-1]
+        latest_ts   = df.index[-1]
+        today       = latest_ts.normalize()
+        today_df    = df[df.index.normalize() == today]
 
-        if not isinstance(ts, pd.Timestamp):
-            return "HOLD"
+        or_bars = today_df[today_df.index.map(self._is_in_opening_range)]
+        if or_bars.empty:
+            return 0
 
-        current_date = str(ts.date())
-        current_time = ts.strftime("%H:%M")
+        range_high = float(or_bars["High"].max())
+        range_low  = float(or_bars["Low"].min())
+        close      = float(df["Close"].iloc[-1])
 
-        # Reset state on new trading day
-        if current_date != self._last_date:
-            self._range_high   = None
-            self._range_low    = None
-            self._range_set    = False
-            self._traded_today = False
-            self._last_date    = current_date
+        if close > range_high:
+            return 1
+        if close < range_low:
+            return -1
+        return 0
 
-        # No new trades after cutoff
-        if current_time >= self.cutoff_time:
-            return "HOLD"
+    def validate_params(self, params: dict) -> bool:
+        interval      = params.get("interval",      self.interval)
+        range_minutes = params.get("range_minutes", self.range_minutes)
+        return (
+            interval in ("1m", "3m", "5m", "15m", "30m")
+            and isinstance(range_minutes, int)
+            and range_minutes > 0
+        )
 
-        # One trade per day rule
-        if self._traded_today:
-            return "HOLD"
-
-        # Build opening range during first orb_minutes
-        open_dt   = pd.Timestamp(f"{current_date} {self.MARKET_OPEN}", tz=ts.tz)
-        range_end = open_dt + pd.Timedelta(minutes=self.orb_minutes)
-
-        if ts < range_end:
-            # Still inside opening range window — track high/low
-            h = float(last_bar["High"])
-            l = float(last_bar["Low"])
-            self._range_high = max(self._range_high or h, h)
-            self._range_low  = min(self._range_low  or l, l)
-            return "HOLD"
-
-        # Opening range is now locked
-        if not self._range_set:
-            self._range_set = True
-            logger.info(
-                f"[orb] Range set for {current_date}: "
-                f"high={self._range_high:.2f}  low={self._range_low:.2f}"
-            )
-
-        close = float(last_bar["Close"])
-
-        if close > (self._range_high or 0):
-            logger.debug(f"[orb] BUY  — close {close:.2f} > range_high {self._range_high:.2f}")
-            self._traded_today = True
-            return "BUY"
-
-        if close < (self._range_low or float("inf")):
-            logger.debug(f"[orb] SELL — close {close:.2f} < range_low {self._range_low:.2f}")
-            self._traded_today = True
-            return "SELL"
-
-        return "HOLD"
-
-    # ── Risk parameters ──────────────────────────────────────────────────────
-    def stop_loss(self, entry_price: float, direction: str = "BUY") -> float:
-        """Stop-loss placed at the opposite range boundary ± stop_pct buffer."""
-        if direction == "BUY" and self._range_low is not None:
-            return round(self._range_low * (1 - self.stop_pct), 2)
-        if direction == "SELL" and self._range_high is not None:
-            return round(self._range_high * (1 + self.stop_pct), 2)
-        return round(entry_price * (1 - self.stop_pct), 2)
-
-    def target(self, entry_price: float, direction: str = "BUY") -> float:
-        """Target = entry +/- (stop distance × target_ratio)."""
-        sl   = self.stop_loss(entry_price, direction)
-        dist = abs(entry_price - sl)
-        if direction == "BUY":
-            return round(entry_price + dist * self.target_ratio, 2)
-        return round(entry_price - dist * self.target_ratio, 2)
+    def metadata(self) -> dict:
+        return {
+            "win_rate":     0.50,
+            "avg_win_pct":  0.025,
+            "avg_loss_pct": 0.015,
+        }

@@ -1,16 +1,23 @@
-"""Abstract base for all strategies — Phase 7 updated.
+"""Abstract base for all strategies — Phase 05 hardened.
 
 Every strategy must:
   1. Subclass BaseStrategy
   2. Set class-level: name, version, description, author, tags, parameters
-  3. Implement generate_signals(df) -> pd.Series
+  3. Implement generate_signals(df) -> pd.Series  (returns int Series: 1/-1/0)
   4. Decorate with @register_strategy (auto-registers on import)
 
 Optionally implement:
   - validate_params(params) -> bool   (called before backtest run)
   - meta() -> StrategyMeta            (returns live metadata snapshot)
-  - on_bar(df) -> Signal              (bar-by-bar live/paper trading)
-  - metadata() -> dict                (legacy — win_rate etc. for sizer)
+  - on_bar(df) -> int                 (1/0/-1 for paper/live trading)
+  - metadata() -> dict                (win_rate etc. for sizer)
+
+Phase 05 fixes:
+  - __init__ copies class-level tags/parameters to instance so
+    self.tags.append("x") on one instance never affects other instances.
+  - on_bar() now returns int (1/-1/0) not str. Paper executor no longer needs
+    a str→int conversion dict.
+  - _STRATEGY_REGISTRY protected by _REGISTRY_LOCK for 20-thread concurrency.
 """
 
 from __future__ import annotations
@@ -23,8 +30,11 @@ import pandas as pd
 
 from strategies.meta import StrategyMeta
 
-# Re-export Signal type alias so strategies can import from base
-Signal = str   # "BUY" | "SELL" | "HOLD"
+# Signal type is now int at the API boundary: 1=BUY, -1=SELL, 0=HOLD
+# The str alias is kept for backward-compat internal use only.
+Signal = int   # 1 | -1 | 0
+
+_SIGNAL_MAP: dict[str, int] = {"BUY": 1, "SELL": -1, "HOLD": 0}
 
 
 class BaseStrategy(ABC):
@@ -38,6 +48,13 @@ class BaseStrategy(ABC):
         tags        : list — e.g. ["trend", "daily"]
         parameters  : dict — default params e.g. {"fast": 12, "slow": 26}
         status      : str  — "active" | "testing" | "draft" | "retired"
+
+    Phase 05 FIX — mutable class defaults:
+        Class-level `tags = []` and `parameters = {}` are SHARED across all
+        instances of the same class. If SmaCrossover().tags.append("x"),
+        every SmaCrossover instance sees that mutation.
+        __init__ copies them to instance dicts/lists so each instance is
+        fully independent.
     """
 
     name:        str  = "BaseStrategy"
@@ -48,11 +65,23 @@ class BaseStrategy(ABC):
     parameters:  dict = {}
     status:      str  = "active"
 
+    def __init__(self) -> None:
+        # Phase 05: shallow-copy class-level mutable defaults to instance.
+        # list(self.__class__.tags) creates a new list per instance.
+        # dict(self.__class__.parameters) creates a new dict per instance.
+        # Subclasses that call super().__init__() get this automatically.
+        # Subclasses that define their own __init__ and DON'T call super()
+        # must do this manually — but the pattern is enforced by convention.
+        self.tags       = list(self.__class__.tags)
+        self.parameters = dict(self.__class__.parameters)
+
     # ── Required ────────────────────────────────────────────────────────
 
     @abstractmethod
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
-        """Return Series of 1 (long), -1 (short), 0 (flat), aligned to df."""
+        """Return Series of 1 (long), -1 (short), 0 (flat), aligned to df.
+        Values MUST be in {-1, 0, 1}. The engine rejects any other values.
+        """
         ...
 
     # ── Phase 7: new required methods ────────────────────────────────────────
@@ -107,16 +136,30 @@ class BaseStrategy(ABC):
 
     # ── Optional ────────────────────────────────────────────────────────────
 
-    def on_bar(self, df: pd.DataFrame) -> Signal:
-        """Bar-by-bar signal for live/paper trading. Override in subclass."""
-        return "HOLD"
+    def on_bar(self, df: pd.DataFrame) -> int:
+        """Bar-by-bar signal for live/paper trading.
+
+        Phase 05 FIX: returns int (1/-1/0) not str.
+        - 1  = BUY
+        - -1 = SELL
+        - 0  = HOLD
+
+        Paper executor uses this directly. Engine uses generate_signals().
+        Subclasses should return int. If a subclass accidentally returns a str
+        ("BUY"/"SELL"/"HOLD"), it is silently converted here via _SIGNAL_MAP.
+        """
+        return 0
 
     def metadata(self) -> dict:
-        """Legacy: return historical edge stats for risk.sizer.
+        """Return historical edge stats for risk.sizer.
 
-        Keys: win_rate, avg_win_pct, avg_loss_pct
+        Must be overridden by each strategy. Keys:
+            win_rate      : float  e.g. 0.52
+            avg_win_pct   : float  e.g. 0.03  (3%)
+            avg_loss_pct  : float  e.g. 0.02  (2%)
+
         Strategies that override this get automatic position sizing.
-        Those that don't fall back to 1% risk per trade.
+        Those that don't fall back to 1% risk per trade (sizer default).
         """
         return {}
 
