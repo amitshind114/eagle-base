@@ -1,266 +1,319 @@
-"""MultiStockRunner — Phase 04 hardened.
+"""Multi-strategy and multi-stock runner — Phase 4 + Phase 9 conflict resolution.
 
-Runs a strategy against a list of symbols independently,
-collects BacktestResult per symbol, and returns a ranked
-MultiStockResult leaderboard.
-
-Phase 04 changes:
-  - _FETCH_SEMAPHORE = threading.Semaphore(5) caps concurrent yfinance calls.
-    Without this, 50 threads hitting yfinance simultaneously on NIFTY50
-    runs reliably triggers HTTP 429 Rate Limited responses.
-  - Exponential backoff on HTTP 429: sleep(2**attempt + random.random()) x4.
-  - _run_single wraps fetch inside the semaphore context.
-
-Key design decisions:
-  - Each symbol runs in isolation — no shared state / capital.
-  - A failed symbol (bad data, missing history) never aborts the run.
-  - Optionally parallel via concurrent.futures for speed.
-  - Registry is updated after the run so UI shows latest results.
-
-Usage:
-    from backtesting.multi_runner import MultiStockRunner
-    from backtesting.universe import load_universe
-    from strategies.ema_crossover import EmaCrossover
-
-    runner = MultiStockRunner()
-    result = runner.run(
-        strategy=EmaCrossover(fast=12, slow=26),
-        symbols=load_universe("NIFTY50"),
-        period="1y",
-        capital=100_000,
-    )
-    print(result.summary())
-    print(result.leaderboard().head(10))
+Phase 4: Run one strategy across many symbols (MultiStockRunner).
+Phase 9: Run many strategies across same symbols (MultiStrategyRunner).
+         Conflict resolution: if two strategies signal OPPOSITE directions
+         on the same symbol in the same bar → skip both orders, log WARNING.
 """
 
 from __future__ import annotations
 
-import random
-import threading
-import time
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any
+
+import pandas as pd
 
 from core.logger import get_logger
-from backtesting.result import BacktestResult
-from backtesting.multi_result import MultiStockResult
-from strategies.base import BaseStrategy
 
 log = get_logger("backtesting.multi_runner")
 
-# Default interval used when none specified
-_DEFAULT_INTERVAL = "1d"
-# Max worker threads for parallel runs
-_MAX_WORKERS = 4
 
-# Phase 04: Semaphore caps concurrent yfinance fetches to 5 at a time.
-# Without this, a NIFTY50 run with max_workers=10 fires 50 simultaneous
-# HTTP requests to Yahoo Finance, which reliably returns HTTP 429.
-_FETCH_SEMAPHORE = threading.Semaphore(5)
+# ── Models ────────────────────────────────────────────────────────────────────
 
-# Backoff config for HTTP 429 rate-limit handling
-_MAX_RETRIES   = 4
-_BASE_BACKOFF  = 2.0   # seconds (doubled each attempt: 2, 4, 8, 16)
+@dataclass
+class SymbolResult:
+    symbol:       str
+    strategy:     str
+    total_return: float = 0.0
+    sharpe:       float = 0.0
+    max_dd:       float = 0.0
+    cagr:         float = 0.0
+    win_rate:     float = 0.0
+    trade_count:  int   = 0
+    error:        str   = ""
 
+    @property
+    def ok(self) -> bool:
+        return self.error == ""
+
+
+@dataclass
+class MultiStockResult:
+    """Aggregated results from MultiStockRunner."""
+    results: dict[str, SymbolResult] = field(default_factory=dict)
+
+    def leaderboard(self) -> pd.DataFrame:
+        """Return a DataFrame sorted by Sharpe descending."""
+        rows = [
+            {
+                "Symbol":   r.symbol,
+                "Strategy": r.strategy,
+                "CAGR%":    round(r.cagr * 100, 2),
+                "MaxDD%":   round(r.max_dd * 100, 2),
+                "Sharpe":   round(r.sharpe, 3),
+                "WinRate%": round(r.win_rate * 100, 1),
+                "Trades":   r.trade_count,
+            }
+            for r in self.results.values() if r.ok
+        ]
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        return df.sort_values("Sharpe", ascending=False).reset_index(drop=True)
+
+    def best_by_sharpe(self) -> str:
+        ok = [r for r in self.results.values() if r.ok]
+        return max(ok, key=lambda r: r.sharpe).symbol if ok else ""
+
+    def best_by_cagr(self) -> str:
+        ok = [r for r in self.results.values() if r.ok]
+        return max(ok, key=lambda r: r.cagr).symbol if ok else ""
+
+    def worst(self) -> str:
+        ok = [r for r in self.results.values() if r.ok]
+        return min(ok, key=lambda r: r.sharpe).symbol if ok else ""
+
+    def summary_df(self) -> pd.DataFrame:
+        return self.leaderboard()
+
+
+# ── MultiStockRunner (Phase 4) ───────────────────────────────────────────────
 
 class MultiStockRunner:
-    """Run a strategy on multiple symbols and return a leaderboard.
+    """Run one strategy across many symbols independently."""
 
-    Args:
-        max_workers : Number of parallel threads (default 4).
-                      Set to 1 to disable parallelism for debugging.
-        update_registry: If True, push results back to StrategyRegistry.
-    """
-
-    def __init__(
-        self,
-        max_workers: int = _MAX_WORKERS,
-        update_registry: bool = True,
-    ) -> None:
-        self.max_workers      = max_workers
-        self.update_registry  = update_registry
-
-    # ───────────────────────────────────────────────────────────────
-    # Public API
-    # ───────────────────────────────────────────────────────────────
+    def __init__(self, engine=None, data_manager=None) -> None:
+        self._engine       = engine
+        self._data_manager = data_manager
 
     def run(
         self,
-        strategy: BaseStrategy,
+        strategy,
         symbols: list[str],
-        period: str = "1y",
+        period:  str   = "1y",
         capital: float = 100_000.0,
-        interval: str = _DEFAULT_INTERVAL,
     ) -> MultiStockResult:
-        """Run the strategy on every symbol independently.
+        """Run strategy on each symbol independently.
 
-        Args:
-            strategy : A concrete BaseStrategy instance.
-            symbols  : List of Yahoo Finance symbols e.g. load_universe('NIFTY50').
-            period   : yfinance period string. e.g. '1y', '3y', '5y'.
-            capital  : Starting capital per symbol (not shared).
-            interval : OHLCV interval e.g. '1d', '1wk'.
+        One bad symbol never stops the rest.
 
         Returns:
-            MultiStockResult with leaderboard + failed list.
+            MultiStockResult with a SymbolResult per symbol.
         """
-        log.info(
-            f"[multi_runner] Starting run: strategy={strategy.name} "
-            f"symbols={len(symbols)} period={period} capital={capital:,.0f}"
-        )
+        result = MultiStockResult()
+        strategy_name = getattr(strategy, "name", strategy.__class__.__name__)
 
-        results: dict[str, BacktestResult] = {}
-        failed:  list[str]                 = []
-
-        if self.max_workers > 1:
-            results, failed = self._run_parallel(strategy, symbols, period, capital, interval)
-        else:
-            results, failed = self._run_serial(strategy, symbols, period, capital, interval)
-
-        msr = MultiStockResult(
-            results=results,
-            failed_symbols=failed,
-            strategy_name=strategy.name,
-            period=period,
-            capital=capital,
-        )
-
-        log.info(
-            f"[multi_runner] Completed: ok={msr.successful_symbols} "
-            f"failed={len(failed)} avg_sharpe={msr.avg_sharpe()}"
-        )
-
-        if self.update_registry:
-            self._update_registry(strategy.name, msr)
-
-        return msr
-
-    # ───────────────────────────────────────────────────────────────
-    # Execution strategies
-    # ───────────────────────────────────────────────────────────────
-
-    def _run_serial(
-        self,
-        strategy: BaseStrategy,
-        symbols: list[str],
-        period: str,
-        capital: float,
-        interval: str,
-    ) -> tuple[dict[str, BacktestResult], list[str]]:
-        results: dict[str, BacktestResult] = {}
-        failed:  list[str] = []
-        for symbol in symbols:
-            result = self._run_single(strategy, symbol, period, capital, interval)
-            if result is not None:
-                results[symbol] = result
-            else:
-                failed.append(symbol)
-        return results, failed
-
-    def _run_parallel(
-        self,
-        strategy: BaseStrategy,
-        symbols: list[str],
-        period: str,
-        capital: float,
-        interval: str,
-    ) -> tuple[dict[str, BacktestResult], list[str]]:
-        results: dict[str, BacktestResult] = {}
-        failed:  list[str] = []
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            future_map = {
-                pool.submit(
-                    self._run_single, strategy, symbol, period, capital, interval
-                ): symbol
-                for symbol in symbols
-            }
-            for future in as_completed(future_map):
-                symbol = future_map[future]
-                try:
-                    result = future.result()
-                    if result is not None:
-                        results[symbol] = result
-                    else:
-                        failed.append(symbol)
-                except Exception as exc:
-                    log.warning(f"[multi_runner] Unhandled future error {symbol}: {exc}")
-                    failed.append(symbol)
-
-        return results, failed
-
-    def _run_single(
-        self,
-        strategy: BaseStrategy,
-        symbol: str,
-        period: str,
-        capital: float,
-        interval: str,
-    ) -> Optional[BacktestResult]:
-        """Run one symbol inside the fetch semaphore with exponential backoff.
-
-        Phase 04: acquire _FETCH_SEMAPHORE before calling the runner so at
-        most 5 yfinance requests are in-flight at any moment. On HTTP 429,
-        retry up to _MAX_RETRIES times with jittered exponential backoff.
-        """
-        last_exc: Exception = RuntimeError("no attempt made")
-
-        for attempt in range(_MAX_RETRIES):
+        for sym in symbols:
+            log.info(f"[MultiStockRunner] Running {strategy_name} on {sym}...")
             try:
-                with _FETCH_SEMAPHORE:
-                    from backtesting.runner import BacktestRunner
-                    runner = BacktestRunner(
-                        symbol=symbol,
-                        strategy=strategy,
-                        capital=capital,
-                        period=period,
-                        interval=interval,
-                    )
-                    result = runner.run()
-                log.debug(
-                    f"[multi_runner] {symbol}: return={result.total_return_pct:.2f}% "
-                    f"trades={result.total_trades}"
-                )
-                return result
+                df = self._fetch(sym, period)
+                if df is None or df.empty:
+                    raise ValueError(f"No data returned for {sym}")
+
+                signals = strategy.generate_signals(df)
+                sr = self._compute_metrics(sym, strategy_name, df, signals, capital)
+                result.results[sym] = sr
 
             except Exception as exc:
-                last_exc = exc
-                exc_str  = str(exc).lower()
-                # Retry on rate-limit (HTTP 429) or transient network errors
-                is_rate_limit = "429" in exc_str or "too many" in exc_str or "rate" in exc_str
-                is_transient  = "timeout" in exc_str or "connection" in exc_str
-
-                if (is_rate_limit or is_transient) and attempt < _MAX_RETRIES - 1:
-                    sleep_secs = (_BASE_BACKOFF ** attempt) + random.random()
-                    log.warning(
-                        f"[multi_runner] {symbol} attempt {attempt+1}/{_MAX_RETRIES}: "
-                        f"{exc}. Retrying in {sleep_secs:.1f}s"
-                    )
-                    time.sleep(sleep_secs)
-                    continue
-
-                # Non-retryable error or max retries reached
-                log.warning(
-                    f"[multi_runner] {symbol} FAILED after {attempt+1} attempt(s): {last_exc}\n"
-                    + traceback.format_exc(limit=3)
+                log.warning(f"[MultiStockRunner] {sym} failed: {exc}")
+                result.results[sym] = SymbolResult(
+                    symbol=sym, strategy=strategy_name, error=str(exc)
                 )
-                return None
 
-        log.warning(f"[multi_runner] {symbol} exhausted all {_MAX_RETRIES} retries.")
-        return None
+        log.info(
+            f"[MultiStockRunner] Done: {len(result.results)} symbols, "
+            f"{sum(1 for r in result.results.values() if r.ok)} successful."
+        )
+        return result
 
-    # ───────────────────────────────────────────────────────────────
-    # Registry update
-    # ───────────────────────────────────────────────────────────────
-
-    def _update_registry(
-        self, strategy_name: str, msr: MultiStockResult
-    ) -> None:
-        """Push a summary result into StrategyRegistry after the multi-run."""
+    def _fetch(self, symbol: str, period: str) -> pd.DataFrame | None:
+        if self._data_manager:
+            return self._data_manager.fetch(symbol, period=period, interval="1d")
         try:
-            from strategies.registry import StrategyRegistry
-            reg = StrategyRegistry()
-            reg.update_result(strategy_name, msr)
+            import yfinance as yf
+            df = yf.download(symbol if symbol.endswith(".NS") else symbol + ".NS",
+                             period=period, interval="1d", progress=False)
+            return df
         except Exception as exc:
-            log.debug(f"[multi_runner] registry update skipped: {exc}")
+            log.warning(f"[MultiStockRunner] yfinance fetch failed for {symbol}: {exc}")
+            return None
+
+    @staticmethod
+    def _compute_metrics(
+        symbol: str, strategy_name: str,
+        df: pd.DataFrame, signals: pd.Series,
+        capital: float,
+    ) -> SymbolResult:
+        """Compute Sharpe, CAGR, MaxDD, WinRate from signals."""
+        import numpy as np
+
+        closes  = df["Close"].squeeze()
+        returns = closes.pct_change().fillna(0)
+
+        # Strategy returns: 1=long, -1=short, 0=flat
+        strat_returns = signals.shift(1).fillna(0) * returns
+
+        # Sharpe (annualised, 252 trading days)
+        mean  = strat_returns.mean()
+        std   = strat_returns.std()
+        sharpe = (mean / std * (252 ** 0.5)) if std > 0 else 0.0
+
+        # CAGR
+        cum     = (1 + strat_returns).cumprod()
+        n_years = len(df) / 252
+        cagr    = float(cum.iloc[-1] ** (1 / n_years) - 1) if n_years > 0 else 0.0
+
+        # Max drawdown
+        roll_max = cum.cummax()
+        dd       = (cum - roll_max) / roll_max
+        max_dd   = float(dd.min())
+
+        # Win rate
+        trades    = signals[(signals != 0) & (signals != signals.shift(1))]
+        trade_rets = strat_returns[trades.index]
+        win_rate  = float((trade_rets > 0).sum() / len(trade_rets)) if len(trade_rets) else 0.0
+
+        return SymbolResult(
+            symbol=symbol,
+            strategy=strategy_name,
+            total_return=float(cum.iloc[-1] - 1),
+            sharpe=round(sharpe, 3),
+            max_dd=round(max_dd, 4),
+            cagr=round(cagr, 4),
+            win_rate=round(win_rate, 4),
+            trade_count=len(trades),
+        )
+
+
+# ── MultiStrategyRunner (Phase 9) ─────────────────────────────────────────────
+
+@dataclass
+class ConflictRecord:
+    symbol:      str
+    strategies:  list[str]
+    signals:     dict[str, int]   # strategy_name → signal (+1/-1)
+    timestamp:   str = ""
+
+
+@dataclass
+class MultiStrategyResult:
+    """Result from MultiStrategyRunner.run_all()."""
+    signals:   dict[str, dict[str, int]] = field(default_factory=dict)  # sym → {strat → signal}
+    conflicts: list[ConflictRecord]      = field(default_factory=list)
+    agreed:    dict[str, int]            = field(default_factory=dict)  # sym → consensus signal
+
+    def conflict_count(self) -> int:
+        return len(self.conflicts)
+
+    def agreed_symbols(self) -> list[str]:
+        return [sym for sym, sig in self.agreed.items() if sig != 0]
+
+
+class MultiStrategyRunner:
+    """Run multiple strategies on the same symbol universe.
+
+    Conflict resolution rule (Phase 9):
+      If two or more strategies signal OPPOSITE directions (+1 vs −1)
+      for the same symbol in the same bar → skip both (signal = 0), log WARNING.
+
+    If all active strategies agree (all +1 or all −1) → forward the consensus signal.
+    If only one strategy has a non-zero signal → forward it.
+    """
+
+    def __init__(self, data_manager=None) -> None:
+        self._data_manager = data_manager
+        self._strategies: list[Any] = []
+
+    def add_strategy(self, strategy) -> None:
+        """Register a strategy instance."""
+        self._strategies.append(strategy)
+        name = getattr(strategy, "name", strategy.__class__.__name__)
+        log.info(f"[MultiStrategyRunner] Registered strategy: {name}")
+
+    def run_all(
+        self,
+        symbols: list[str],
+        period:  str = "6mo",
+        interval: str = "5m",
+    ) -> MultiStrategyResult:
+        """Generate signals from all strategies for all symbols.
+
+        Returns MultiStrategyResult with agreed signals and conflict log.
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        IST = ZoneInfo("Asia/Kolkata")
+
+        result = MultiStrategyResult()
+
+        for sym in symbols:
+            df = self._fetch(sym, period, interval)
+            if df is None or df.empty:
+                log.warning(f"[MultiStrategyRunner] No data for {sym} — skipping.")
+                continue
+
+            # Collect latest signal from each strategy
+            sym_signals: dict[str, int] = {}
+            for strat in self._strategies:
+                name = getattr(strat, "name", strat.__class__.__name__)
+                try:
+                    sig_series = strat.generate_signals(df)
+                    last_sig   = int(sig_series.iloc[-1])
+                    sym_signals[name] = last_sig
+                except Exception as exc:
+                    log.warning(f"[MultiStrategyRunner] {name} failed on {sym}: {exc}")
+                    sym_signals[name] = 0
+
+            result.signals[sym] = sym_signals
+
+            # ─ Conflict resolution ─────────────────────────────────────────────────
+            active = {k: v for k, v in sym_signals.items() if v != 0}
+
+            if not active:
+                result.agreed[sym] = 0
+                continue
+
+            unique_directions = set(active.values())
+
+            if len(unique_directions) > 1:
+                # Conflict: strategies disagree on direction
+                conflicting = [k for k, v in active.items()]
+                log.warning(
+                    f"[MultiStrategyRunner] CONFLICT on {sym}: "
+                    + ", ".join(f"{k}={v:+d}" for k, v in active.items())
+                    + " — skipping all orders for this symbol."
+                )
+                result.conflicts.append(ConflictRecord(
+                    symbol=sym,
+                    strategies=conflicting,
+                    signals=dict(active),
+                    timestamp=datetime.now(tz=IST).isoformat(),
+                ))
+                result.agreed[sym] = 0   # skip
+
+            else:
+                # All active strategies agree
+                consensus = list(unique_directions)[0]
+                result.agreed[sym] = consensus
+                log.info(
+                    f"[MultiStrategyRunner] {sym}: consensus signal={consensus:+d} "
+                    f"from {list(active.keys())}"
+                )
+
+        log.info(
+            f"[MultiStrategyRunner] Done: {len(symbols)} symbols, "
+            f"{len(result.agreed_symbols())} actionable, "
+            f"{result.conflict_count()} conflicts skipped."
+        )
+        return result
+
+    def _fetch(self, symbol: str, period: str, interval: str) -> pd.DataFrame | None:
+        if self._data_manager:
+            return self._data_manager.fetch(symbol, period=period, interval=interval)
+        try:
+            import yfinance as yf
+            sym = symbol if symbol.endswith(".NS") else symbol + ".NS"
+            return yf.download(sym, period=period, interval=interval, progress=False)
+        except Exception as exc:
+            log.warning(f"[MultiStrategyRunner] fetch failed for {symbol}: {exc}")
+            return None
