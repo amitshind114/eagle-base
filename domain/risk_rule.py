@@ -23,7 +23,7 @@ class RiskAction(str, Enum):
 
 
 class RiskRuleResult(BaseModel):
-    model_config = {"frozen": True"}
+    model_config = {"frozen": True}
     rule_name: str
     action: RiskAction
     reason: str
