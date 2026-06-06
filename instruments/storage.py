@@ -1,215 +1,249 @@
-"""SQLite storage for instrument master — Phase 1.
+"""Instruments SQLite storage — Phase 1.
+
+WAL mode + single-transaction bulk inserts so a crash during refresh never
+leaves a half-written instrument master.  A `schema_version` table records
+the last successful refresh timestamp.
 
 Tables:
-  equity   — all NSE equity instruments
-  futures  — F&O futures
-  options  — F&O options (CE/PE)
-  indices  — index instruments
+    equity      — NSE equity master
+    futures     — F&O futures instruments
+    options     — F&O option instruments
+    indices     — Index instruments
+    schema_version — refresh timestamp + version
+
+Indexes on: symbol, underlying, expiry, strike for fast look-up.
 
 Usage:
-    from instruments.storage import InstrumentStore
-    store = InstrumentStore()
-    store.insert_bulk(instruments)
-    results = store.search("RELIANCE")
-    inst    = store.get_by_symbol("RELIANCE-EQ")
+    storage = InstrumentStorage()
+    storage.init_db()
+    storage.insert_bulk("equity", rows)          # atomic
+    results = storage.search("RELIANCE")
+    inst = storage.get_by_symbol("RELIANCE-EQ")
+    print(storage.last_refresh())                # ISO timestamp or None
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Optional
 
-from core.logger import get_logger
-from .models import Instrument
+log = logging.getLogger("instruments.storage")
 
-log = get_logger("instruments.storage")
+DB_PATH = Path("eagle_base/data/instruments.db")
 
-_DB_PATH = Path("eagle_base/data/instruments.db")
+_SCHEMA_VERSION = "1.0.0"
 
-_DDL = """
-CREATE TABLE IF NOT EXISTS instruments (
-    symbol      TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    exchange    TEXT NOT NULL DEFAULT 'NSE',
-    segment     TEXT NOT NULL DEFAULT 'EQ',
-    isin        TEXT DEFAULT '',
-    lot_size    INTEGER DEFAULT 1,
-    tick_size   REAL DEFAULT 0.05,
-    sector      TEXT DEFAULT '',
-    industry    TEXT DEFAULT '',
-    underlying  TEXT DEFAULT '',
-    expiry      TEXT DEFAULT '',
-    strike      REAL DEFAULT 0,
-    option_type TEXT DEFAULT '',
-    yf_symbol   TEXT DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_underlying ON instruments(underlying);
-CREATE INDEX IF NOT EXISTS idx_segment    ON instruments(segment);
-CREATE INDEX IF NOT EXISTS idx_name       ON instruments(name COLLATE NOCASE);
-"""
+# Shared column list for all segment tables
+_COLS = (
+    "symbol", "name", "exchange", "segment",
+    "isin", "lot_size", "tick_size",
+    "expiry", "strike", "option_type",
+    "underlying", "yf_symbol",
+)
+_COLS_SQL = ", ".join(f"{c} TEXT" for c in _COLS)
+_PLACEHOLDERS = ", ".join("?" for _ in _COLS)
 
 
-class InstrumentStore:
-    """SQLite-backed instrument master store."""
+class InstrumentStorage:
+    """SQLite wrapper for the instrument master database."""
 
-    def __init__(self, db_path: Path = _DB_PATH) -> None:
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+    def __init__(self, db_path: Path = DB_PATH) -> None:
+        self._db_path = db_path
 
-    # ── Write ─────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Schema init
+    # ------------------------------------------------------------------
 
-    def insert_bulk(self, instruments: List[Instrument]) -> int:
-        """Upsert a list of instruments. Returns count inserted/updated."""
-        rows = [self._to_row(i) for i in instruments]
-        with self._conn() as conn:
+    def init_db(self) -> None:
+        """Create tables and indexes if they don't exist."""
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+
+            for table in ("equity", "futures", "options", "indices"):
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} ({_COLS_SQL})"
+                )
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_symbol "
+                    f"ON {table}(symbol)"
+                )
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_underlying "
+                    f"ON {table}(underlying)"
+                )
+                if table in ("futures", "options"):
+                    conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_{table}_expiry "
+                        f"ON {table}(expiry)"
+                    )
+                if table == "options":
+                    conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_options_strike "
+                        f"ON options(strike)"
+                    )
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version       TEXT,
+                    last_refresh  TEXT
+                )
+            """)
+            conn.commit()
+            log.info("[storage] DB initialised at %s", self._db_path)
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Atomic bulk insert (WAL + BEGIN IMMEDIATE)
+    # ------------------------------------------------------------------
+
+    def insert_bulk(
+        self,
+        table: str,
+        rows: list[dict[str, Any]],
+        replace: bool = True,
+    ) -> int:
+        """Insert rows into *table* inside a single atomic transaction.
+
+        Uses BEGIN IMMEDIATE so concurrent readers can still proceed (WAL)
+        but no second writer can interleave.  On any exception the whole
+        batch is rolled back — the old data remains intact.
+
+        Args:
+            table  : One of 'equity', 'futures', 'options', 'indices'.
+            rows   : List of dicts keyed by column name.
+            replace: If True, DELETE existing rows first (full refresh).
+
+        Returns:
+            Number of rows inserted.
+        """
+        if not rows:
+            return 0
+
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+
+            conn.execute("BEGIN IMMEDIATE")
+
+            if replace:
+                conn.execute(f"DELETE FROM {table}")
+
+            tuples = [
+                tuple(row.get(c, None) for c in _COLS)
+                for row in rows
+            ]
             conn.executemany(
-                """
-                INSERT OR REPLACE INTO instruments
-                (symbol, name, exchange, segment, isin, lot_size, tick_size,
-                 sector, industry, underlying, expiry, strike, option_type, yf_symbol)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                rows,
+                f"INSERT INTO {table} VALUES ({_PLACEHOLDERS})",
+                tuples,
             )
-        log.info(f"Upserted {len(rows)} instruments.")
-        return len(rows)
 
-    def clear(self, segment: Optional[str] = None) -> None:
-        """Clear all or segment-specific instruments."""
-        with self._conn() as conn:
-            if segment:
-                conn.execute("DELETE FROM instruments WHERE segment=?", (segment,))
-            else:
-                conn.execute("DELETE FROM instruments")
+            # Update refresh timestamp
+            conn.execute("DELETE FROM schema_version")
+            conn.execute(
+                "INSERT INTO schema_version VALUES (?, ?)",
+                (_SCHEMA_VERSION, datetime.now().isoformat()),
+            )
 
-    # ── Read ──────────────────────────────────────────────────────────────
+            conn.execute("COMMIT")
+            log.info("[storage] Inserted %d rows into '%s'", len(rows), table)
+            return len(rows)
 
-    def search(self, query: str, limit: int = 50) -> List[Instrument]:
-        """Full-text search across symbol, name, underlying."""
-        q = f"%{query.upper()}%"
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM instruments
-                WHERE UPPER(symbol) LIKE ?
-                   OR UPPER(name)   LIKE ?
-                   OR UPPER(underlying) LIKE ?
-                ORDER BY
-                    CASE segment
-                        WHEN 'EQ'  THEN 1
-                        WHEN 'IDX' THEN 2
-                        WHEN 'FUT' THEN 3
-                        WHEN 'CE'  THEN 4
-                        WHEN 'PE'  THEN 5
-                        ELSE 6
-                    END
-                LIMIT ?
-                """,
-                (q, q, q, limit),
-            ).fetchall()
-        return [self._from_row(r) for r in rows]
+        except Exception:
+            conn.execute("ROLLBACK")
+            log.exception("[storage] insert_bulk FAILED for '%s' — rolled back", table)
+            raise
+        finally:
+            conn.close()
 
-    def get_by_symbol(self, symbol: str) -> Optional[Instrument]:
-        """Exact symbol lookup."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM instruments WHERE UPPER(symbol)=?",
-                (symbol.upper(),),
-            ).fetchone()
-        return self._from_row(row) if row else None
+    # ------------------------------------------------------------------
+    # Read operations
+    # ------------------------------------------------------------------
 
-    def list_by_segment(self, segment: str) -> List[Instrument]:
-        """All instruments for a segment: EQ, FUT, CE, PE, IDX."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM instruments WHERE segment=? ORDER BY symbol",
-                (segment.upper(),),
-            ).fetchall()
-        return [self._from_row(r) for r in rows]
-
-    def list_all(self, exchange: Optional[str] = None) -> List[Instrument]:
-        """Return all instruments, optionally filtered by exchange."""
-        with self._conn() as conn:
-            if exchange:
-                rows = conn.execute(
-                    "SELECT * FROM instruments WHERE UPPER(exchange)=? ORDER BY symbol",
-                    (exchange.upper(),),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM instruments ORDER BY symbol"
-                ).fetchall()
-        return [self._from_row(r) for r in rows]
-
-    def list_underlyings(self) -> List[str]:
-        """All unique underlying symbols (stocks with F&O)."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT underlying FROM instruments WHERE underlying != '' ORDER BY underlying"
-            ).fetchall()
-        return [r[0] for r in rows]
-
-    def count(self) -> int:
-        """Total count of instruments in the store."""
-        with self._conn() as conn:
-            row = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()
-        return int(row[0])
-
-    def count_by_segment(self) -> dict[str, int]:
-        """Count of instruments per segment."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT segment, COUNT(*) FROM instruments GROUP BY segment"
-            ).fetchall()
-        return dict(rows)
-
-    # ── Internals ─────────────────────────────────────────────────────────
-
-    def _init_db(self) -> None:
-        with self._conn() as conn:
-            conn.executescript(_DDL)
-
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+    def search(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Full-text search across all four tables by symbol or name prefix."""
+        pattern = f"%{query.upper()}%"
+        results: list[dict] = []
+        conn = sqlite3.connect(str(self._db_path))
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            for table in ("equity", "futures", "options", "indices"):
+                rows = conn.execute(
+                    f"SELECT * FROM {table} "
+                    f"WHERE UPPER(symbol) LIKE ? OR UPPER(name) LIKE ? "
+                    f"LIMIT ?",
+                    (pattern, pattern, limit),
+                ).fetchall()
+                for r in rows:
+                    d = dict(r)
+                    d["_table"] = table
+                    results.append(d)
+        finally:
+            conn.close()
+        return results[:limit]
 
-    @staticmethod
-    def _to_row(i: Instrument) -> tuple:
-        return (
-            i.symbol, i.name, i.exchange, i.segment, i.isin,
-            i.lot_size, i.tick_size, i.sector, i.industry,
-            i.underlying or "",
-            i.expiry.isoformat() if i.expiry else "",
-            i.strike or 0.0,
-            i.option_type or "",
-            i.yf_symbol,
-        )
+    def get_by_symbol(self, symbol: str, table: str = "equity") -> Optional[dict]:
+        """Exact-match lookup by symbol in a specific table."""
+        conn = sqlite3.connect(str(self._db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                f"SELECT * FROM {table} WHERE symbol = ?", (symbol,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
-    @staticmethod
-    def _from_row(row: sqlite3.Row) -> Instrument:
-        from datetime import date
-        expiry = None
-        if row["expiry"]:
-            try:
-                expiry = date.fromisoformat(row["expiry"])
-            except ValueError:
-                expiry = None
-        return Instrument(
-            symbol=row["symbol"],
-            name=row["name"],
-            exchange=row["exchange"],
-            segment=row["segment"],
-            isin=row["isin"],
-            lot_size=row["lot_size"],
-            tick_size=row["tick_size"],
-            sector=row["sector"],
-            industry=row["industry"],
-            underlying=row["underlying"] or None,
-            expiry=expiry,
-            strike=row["strike"] or None,
-            option_type=row["option_type"] or None,
-            yf_symbol=row["yf_symbol"],
-        )
+    def list_all(self, table: str) -> list[dict]:
+        """Return all rows from a table."""
+        conn = sqlite3.connect(str(self._db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Version / refresh timestamp
+    # ------------------------------------------------------------------
+
+    def last_refresh(self) -> Optional[str]:
+        """Return ISO timestamp of last successful refresh, or None."""
+        if not self._db_path.exists():
+            return None
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            row = conn.execute(
+                "SELECT last_refresh FROM schema_version ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+    def schema_version(self) -> Optional[str]:
+        """Return the schema version string."""
+        if not self._db_path.exists():
+            return None
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            row = conn.execute(
+                "SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+    def __repr__(self) -> str:
+        return f"<InstrumentStorage db={self._db_path} last_refresh={self.last_refresh()}>"
