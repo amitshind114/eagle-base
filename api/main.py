@@ -1,4 +1,4 @@
-"""FastAPI application entry point — Phase 07.
+"""FastAPI application entry point.
 
 Registered routers:
   /api/data        — OHLCV data fetch
@@ -7,6 +7,7 @@ Registered routers:
   /api/risk        — position sizing / VaR
   /api/broker      — broker connection status (Angel One stub)
   /api/paper       — paper trading: signal, positions, snapshot, trades
+  /api/live        — live trading: deploy, pause, stop, kill switches
 """
 
 from __future__ import annotations
@@ -15,11 +16,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .routers import data, instruments, backtesting, risk, broker
-from .routers import paper as paper_router  # NEW
+from .routers import paper as paper_router
+from .routers import live  as live_router
 
 app = FastAPI(
     title="Eagle-Base API",
-    version="0.2.0",
+    version="0.3.0",
     description="Algorithmic Research & Trading System API",
 )
 
@@ -35,13 +37,14 @@ app.include_router(data.router,            prefix="/api/data",        tags=["Dat
 app.include_router(instruments.router,     prefix="/api/instruments",  tags=["Instruments"])
 app.include_router(backtesting.router,     prefix="/api/backtest",     tags=["Backtesting"])
 app.include_router(risk.router,            prefix="/api/risk",         tags=["Risk"])
-app.include_router(broker.router,          prefix="/api/broker",       tags=["Broker"])      # was missing
-app.include_router(paper_router.router,    prefix="/api/paper",        tags=["Paper Trading"])  # NEW
+app.include_router(broker.router,          prefix="/api/broker",       tags=["Broker"])
+app.include_router(paper_router.router,    prefix="/api/paper",        tags=["Paper Trading"])
+app.include_router(live_router.router,     prefix="/api/live",         tags=["Live Trading"])
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "Eagle-Base", "version": "0.2.0"}
+    return {"status": "ok", "app": "Eagle-Base", "version": "0.3.0"}
 
 
 @app.get("/api")
@@ -55,5 +58,6 @@ def api_index():
             "/api/risk",
             "/api/broker",
             "/api/paper",
+            "/api/live",
         ]
     }
