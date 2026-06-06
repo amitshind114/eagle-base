@@ -1,49 +1,106 @@
-"""Abstract base for all strategies.
+"""Abstract base for all strategies — Phase 7 updated.
 
-Every strategy must implement `generate_signals(df)`.
-Optionally implement `metadata()` to unlock automatic position sizing
-via risk.sizer — without it the sizer falls back to 1% risk per trade.
+Every strategy must:
+  1. Subclass BaseStrategy
+  2. Set class-level: name, version, description, author, tags, parameters
+  3. Implement generate_signals(df) -> pd.Series
+  4. Decorate with @register_strategy (auto-registers on import)
 
-Optional `atr(df)` delegates to ai.indicators so strategies don\'t need
-to recompute it inline.
+Optionally implement:
+  - validate_params(params) -> bool   (called before backtest run)
+  - meta() -> StrategyMeta            (returns live metadata snapshot)
+  - on_bar(df) -> Signal              (bar-by-bar live/paper trading)
+  - metadata() -> dict                (legacy — win_rate etc. for sizer)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 import pandas as pd
 
+from strategies.meta import StrategyMeta
+
+# Re-export Signal type alias so strategies can import from base
+Signal = str   # "BUY" | "SELL" | "HOLD"
+
 
 class BaseStrategy(ABC):
-    name:        str = "BaseStrategy"
-    version:     str = "1.0.0"
-    description: str = ""
+    """Abstract base strategy.
+
+    Class-level attributes (set in each subclass):
+        name        : str  — unique identifier e.g. "EMA Crossover"
+        version     : str  — semver e.g. "1.1.0"
+        description : str  — one-line summary
+        author      : str  — creator  (default "eagle")
+        tags        : list — e.g. ["trend", "daily"]
+        parameters  : dict — default params e.g. {"fast": 12, "slow": 26}
+        status      : str  — "active" | "testing" | "draft" | "retired"
+    """
+
+    name:        str  = "BaseStrategy"
+    version:     str  = "1.0.0"
+    description: str  = ""
+    author:      str  = "eagle"
+    tags:        list = []
+    parameters:  dict = {}
+    status:      str  = "active"
+
+    # ── Required ────────────────────────────────────────────────────────
 
     @abstractmethod
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         """Return Series of 1 (long), -1 (short), 0 (flat), aligned to df."""
         ...
 
+    # ── Phase 7: new required methods ────────────────────────────────────────
+
+    def meta(self) -> StrategyMeta:
+        """Return a live StrategyMeta snapshot for this instance.
+
+        The registry stores and updates this after every backtest run.
+        Override if your strategy needs a custom StrategyMeta.
+        """
+        return StrategyMeta(
+            name=self.name,
+            version=self.version,
+            author=self.author,
+            description=self.description,
+            parameters=self.parameters,
+            tags=list(self.tags),
+            status=self.status,
+        )
+
+    def validate_params(self, params: dict[str, Any]) -> bool:
+        """Return True if params are valid for this strategy.
+
+        Called by StrategyRegistry before instantiating with custom params.
+        Override to add strategy-specific validation.
+
+        Default: always True (no validation).
+        """
+        return True
+
+    # ── Optional ────────────────────────────────────────────────────────────
+
+    def on_bar(self, df: pd.DataFrame) -> Signal:
+        """Bar-by-bar signal for live/paper trading. Override in subclass."""
+        return "HOLD"
+
     def metadata(self) -> dict:
-        """Return historical edge stats used by risk.sizer for position sizing.
+        """Legacy: return historical edge stats for risk.sizer.
 
-        Strategies that override this get automatic, volatility-adjusted
-        position sizing.  Those that don\'t fall back to 1% risk per trade.
-
-        Keys:
-            win_rate      float  0–1    e.g. 0.58
-            avg_win_pct   float  0–1    average winning trade as fraction of capital
-            avg_loss_pct  float  0–1    average losing trade as fraction of capital
+        Keys: win_rate, avg_win_pct, avg_loss_pct
+        Strategies that override this get automatic position sizing.
+        Those that don\'t fall back to 1% risk per trade.
         """
         return {}
 
-    def atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """ATR as a fraction of close price, delegated to ai.indicators.
+    # ── ATR helper ────────────────────────────────────────────────────────────
 
-        Returns a Series aligned to df.  Falls back to a simple TR-based
-        calculation if ai.indicators is unavailable.
-        """
+    def atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """ATR as fraction of close. Falls back to TR-based if ai.indicators unavailable."""
         try:
             from ai.indicators import atr as _atr
             return _atr(df, period=period) / df["Close"]
@@ -67,16 +124,12 @@ class BaseStrategy(ABC):
         capital: float,
         lot_size: int = 1,
     ) -> int:
-        """Return a position-sized quantity using risk.sizer.
-
-        Uses metadata() for Kelly inputs and atr(df) for volatility scalar.
-        Falls back to a conservative 1% risk per trade if metadata is empty.
-        """
+        """Position-sized quantity via risk.sizer."""
         from risk.sizer import PositionSizer
-        meta       = self.metadata()
-        win_rate   = float(meta.get("win_rate",     0.50))
-        avg_win    = float(meta.get("avg_win_pct",  0.02))
-        avg_loss   = float(meta.get("avg_loss_pct", 0.01))
+        m          = self.metadata()
+        win_rate   = float(m.get("win_rate",     0.50))
+        avg_win    = float(m.get("avg_win_pct",  0.02))
+        avg_loss   = float(m.get("avg_loss_pct", 0.01))
         atr_pct    = float(self.atr(df).iloc[-1]) if not df.empty else 0.015
         sizer      = PositionSizer(total_capital=capital)
         result     = sizer.size(
@@ -88,3 +141,29 @@ class BaseStrategy(ABC):
 
     def __repr__(self) -> str:
         return f"{self.name} v{self.version}"
+
+
+# ── @register_strategy decorator ────────────────────────────────────────────────
+
+# Module-level registry dict — populated by @register_strategy on import.
+# StrategyRegistry reads from this at startup.
+_STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {}
+
+
+def register_strategy(cls: type[BaseStrategy]) -> type[BaseStrategy]:
+    """Class decorator — auto-registers a strategy on import.
+
+    Usage:
+        @register_strategy
+        class EmaCrossover(BaseStrategy):
+            name = "EMA Crossover"
+            ...
+
+    Effect:
+        strategies.base._STRATEGY_REGISTRY["EMA Crossover"] = EmaCrossover
+
+    The decorator is a pure passthrough — it never modifies the class.
+    Existing code that uses EmaCrossover directly is completely unaffected.
+    """
+    _STRATEGY_REGISTRY[cls.name] = cls
+    return cls

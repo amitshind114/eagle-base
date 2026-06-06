@@ -1,70 +1,168 @@
-"""Strategy Registry — Priority 4.
+"""Strategy Registry — Phase 7 complete.
 
-Register and load strategies by name.
-Allows dynamic strategy loading for UI and API.
+Single source of truth for all registered strategies.
+Strategies self-register via the @register_strategy decorator on import.
+This registry reads from the module-level _STRATEGY_REGISTRY dict in base.py.
 
 Usage:
-    registry = StrategyRegistry()
-    registry.register(SMACrossoverStrategy)
-    strategy = registry.get("sma_crossover", fast=10, slow=30)
+    from strategies.registry import StrategyRegistry
+    reg = StrategyRegistry()
+
+    # Get all strategies
+    reg.list_all()                     # → list[StrategyMeta]
+    reg.list_by_tag("trend")           # → list[StrategyMeta]
+
+    # Instantiate
+    strategy = reg.get("EMA Crossover")           # default params
+    strategy = reg.get("EMA Crossover", fast=9, slow=21)  # custom params
+
+    # Results
+    reg.update_result("EMA Crossover", result)    # store backtest result
+    reg.get_latest_result("EMA Crossover")        # → BacktestResult | None
 """
 
 from __future__ import annotations
 
-from typing import Type
+from typing import Any, Optional, Type
 
-from core.logger import logger
-from strategies.base import BaseStrategy
+from core.logger import get_logger
+from strategies.base import BaseStrategy, _STRATEGY_REGISTRY
+from strategies.meta import StrategyMeta
+
+log = get_logger("strategies.registry")
 
 
 class StrategyRegistry:
-    """Registry for strategy classes — register once, instantiate anywhere."""
+    """Registry for strategy classes — register once, instantiate anywhere.
 
-    def __init__(self):
-        self._registry: dict[str, Type[BaseStrategy]] = {}
+    Strategies register themselves via @register_strategy on import.
+    The registry triggers those imports in _load_defaults().
+    """
+
+    def __init__(self) -> None:
+        self._results: dict[str, Any] = {}  # name → BacktestResult
         self._load_defaults()
 
+    # ── Bootstrap ──────────────────────────────────────────────────────────
+
     def _load_defaults(self) -> None:
-        """Auto-register built-in strategies."""
-        from strategies.sma_crossover import SMACrossoverStrategy
-        from strategies.rsi_strategy import RSIStrategy
-        self.register(SMACrossoverStrategy)
-        self.register(RSIStrategy)
-        logger.info(f"[registry] Loaded {len(self._registry)} strategies")
+        """Import all built-in strategies so their @register_strategy fires."""
+        import strategies.sma_crossover      # noqa: F401
+        import strategies.ema_crossover      # noqa: F401
+        import strategies.macd_signal        # noqa: F401
+        import strategies.rsi_mean_reversion # noqa: F401
+        log.info(
+            f"[registry] Loaded {len(_STRATEGY_REGISTRY)} strategies: "
+            f"{list(_STRATEGY_REGISTRY.keys())}"
+        )
+
+    # ── Registration ────────────────────────────────────────────────────────
 
     def register(self, strategy_class: Type[BaseStrategy]) -> None:
-        """Register a strategy class by its name attribute."""
-        self._registry[strategy_class.name] = strategy_class
-        logger.debug(f"[registry] Registered: {strategy_class.name}")
+        """Manually register a strategy class (alternative to decorator)."""
+        _STRATEGY_REGISTRY[strategy_class.name] = strategy_class
+        log.debug(f"[registry] Manually registered: {strategy_class.name}")
+
+    # ── Retrieval ───────────────────────────────────────────────────────────
 
     def get(self, name: str, **params) -> BaseStrategy:
         """Instantiate a registered strategy by name.
 
         Args:
-            name:   Strategy name e.g. 'sma_crossover', 'rsi_strategy'
-            **params: Parameters passed to strategy __init__
+            name   : Exact strategy name e.g. 'EMA Crossover', 'RSI Mean Reversion'
+            **params: Override default parameters e.g. fast=9, slow=21
 
         Returns:
-            Instantiated strategy object
+            Ready-to-use strategy instance.
 
         Raises:
-            KeyError if strategy name not found
+            KeyError: Strategy name not registered.
         """
-        if name not in self._registry:
-            available = list(self._registry.keys())
-            raise KeyError(f"Strategy '{name}' not found. Available: {available}")
-        return self._registry[name](**params)
+        cls = self._get_class(name)
+        if params:
+            if not cls().validate_params(params):
+                raise ValueError(
+                    f"Invalid params {params} for strategy '{name}'. "
+                    f"Check validate_params() in the strategy class."
+                )
+            return cls(**params)
+        return cls()
 
-    def list_strategies(self) -> list[dict]:
-        """List all registered strategies with metadata."""
-        return [
-            cls().__class__.__dict__ and cls().info()
-            for cls in self._registry.values()
-        ]
+    def get_class(self, name: str) -> Type[BaseStrategy]:
+        """Return the strategy class (not an instance) by name."""
+        return self._get_class(name)
+
+    def _get_class(self, name: str) -> Type[BaseStrategy]:
+        if name not in _STRATEGY_REGISTRY:
+            available = list(_STRATEGY_REGISTRY.keys())
+            raise KeyError(
+                f"Strategy '{name}' not found. "
+                f"Available: {available}"
+            )
+        return _STRATEGY_REGISTRY[name]
+
+    # ── Listing ─────────────────────────────────────────────────────────────
+
+    def list_all(self) -> list[StrategyMeta]:
+        """Return StrategyMeta for every registered strategy."""
+        metas = []
+        for name, cls in _STRATEGY_REGISTRY.items():
+            try:
+                m = cls().meta()
+                if name in self._results:
+                    m.last_result = self._results[name]
+                metas.append(m)
+            except Exception as exc:
+                log.warning(f"[registry] meta() failed for {name}: {exc}")
+        return metas
+
+    def list_by_tag(self, tag: str) -> list[StrategyMeta]:
+        """Return strategies whose tags list contains the given tag.
+
+        Args:
+            tag: e.g. 'trend', 'momentum', 'mean_reversion', 'intraday'
+        """
+        return [m for m in self.list_all() if tag in m.tags]
 
     def names(self) -> list[str]:
-        """Return list of registered strategy names."""
-        return list(self._registry.keys())
+        """Return list of all registered strategy names."""
+        return list(_STRATEGY_REGISTRY.keys())
 
     def count(self) -> int:
-        return len(self._registry)
+        return len(_STRATEGY_REGISTRY)
+
+    # ── Results ─────────────────────────────────────────────────────────────
+
+    def update_result(self, name: str, result: Any) -> None:
+        """Store the latest BacktestResult for a strategy.
+
+        Called automatically by MultiStockRunner and PortfolioEngine
+        after each completed backtest.
+
+        Args:
+            name  : Strategy name matching strategy.name class attribute.
+            result: Any BacktestResult-like object with a summary() method.
+        """
+        if name not in _STRATEGY_REGISTRY:
+            log.warning(f"[registry] update_result: '{name}' is not registered.")
+            return
+        self._results[name] = result
+        log.debug(f"[registry] Result updated for '{name}'")
+
+    def get_latest_result(self, name: str) -> Optional[Any]:
+        """Return the most recent BacktestResult for a strategy, or None."""
+        return self._results.get(name)
+
+    # ── Legacy compat ──────────────────────────────────────────────────────────
+
+    def list_strategies(self) -> list[dict]:
+        """Legacy alias — returns list of metadata dicts.
+
+        Kept for backward compatibility with existing UI code.
+        Prefer list_all() for new code.
+        """
+        return [m.to_dict() for m in self.list_all()]
+
+    def list_names(self) -> list[str]:
+        """Legacy alias for names()."""
+        return self.names()
