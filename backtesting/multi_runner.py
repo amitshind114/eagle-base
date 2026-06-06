@@ -1,319 +1,192 @@
-"""Multi-strategy and multi-stock runner — Phase 4 + Phase 9 conflict resolution.
+"""Multi-strategy runner with conflict resolution.
 
-Phase 4: Run one strategy across many symbols (MultiStockRunner).
-Phase 9: Run many strategies across same symbols (MultiStrategyRunner).
-         Conflict resolution: if two strategies signal OPPOSITE directions
-         on the same symbol in the same bar → skip both orders, log WARNING.
+Runs N strategies concurrently on a shared symbol universe.
+When two strategies disagree on the same symbol (BUY vs SELL),
+the conflict is detected and the trade is skipped — no position is taken.
+
+Usage:
+    from backtesting.multi_runner import MultiStrategyRunner
+
+    runner = MultiStrategyRunner(
+        strategies=[sma_crossover, ema_crossover],
+        symbols=["NIFTYBEES", "RELIANCE", "INFY", "TCS", "HDFCBANK"],
+        executor=executor,
+        session="live",
+    )
+    runner.run_once()   # evaluate all strategies on current bar
+
+Conflict resolution rule (Phase 09 P2):
+    If strategy_A signals BUY  and strategy_B signals SELL for the same symbol
+    → skip the trade for that symbol this bar.
+    If both agree (BUY+BUY or SELL+SELL) → proceed with whichever is first.
+    If only one strategy has a view   → proceed normally.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
-import pandas as pd
-
+from core.audit import audit
 from core.logger import get_logger
 
 log = get_logger("backtesting.multi_runner")
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Typing helpers ────────────────────────────────────────────────────────────
 
-@dataclass
-class SymbolResult:
-    symbol:       str
-    strategy:     str
-    total_return: float = 0.0
-    sharpe:       float = 0.0
-    max_dd:       float = 0.0
-    cagr:         float = 0.0
-    win_rate:     float = 0.0
-    trade_count:  int   = 0
-    error:        str   = ""
+class Strategy(Protocol):
+    """Minimal interface every strategy must satisfy."""
+    name: str
+    def generate_signal(self, symbol: str, bar: dict) -> str | None:
+        """Return 'BUY', 'SELL', or None."""
+        ...
 
-    @property
-    def ok(self) -> bool:
-        return self.error == ""
-
-
-@dataclass
-class MultiStockResult:
-    """Aggregated results from MultiStockRunner."""
-    results: dict[str, SymbolResult] = field(default_factory=dict)
-
-    def leaderboard(self) -> pd.DataFrame:
-        """Return a DataFrame sorted by Sharpe descending."""
-        rows = [
-            {
-                "Symbol":   r.symbol,
-                "Strategy": r.strategy,
-                "CAGR%":    round(r.cagr * 100, 2),
-                "MaxDD%":   round(r.max_dd * 100, 2),
-                "Sharpe":   round(r.sharpe, 3),
-                "WinRate%": round(r.win_rate * 100, 1),
-                "Trades":   r.trade_count,
-            }
-            for r in self.results.values() if r.ok
-        ]
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        return df.sort_values("Sharpe", ascending=False).reset_index(drop=True)
-
-    def best_by_sharpe(self) -> str:
-        ok = [r for r in self.results.values() if r.ok]
-        return max(ok, key=lambda r: r.sharpe).symbol if ok else ""
-
-    def best_by_cagr(self) -> str:
-        ok = [r for r in self.results.values() if r.ok]
-        return max(ok, key=lambda r: r.cagr).symbol if ok else ""
-
-    def worst(self) -> str:
-        ok = [r for r in self.results.values() if r.ok]
-        return min(ok, key=lambda r: r.sharpe).symbol if ok else ""
-
-    def summary_df(self) -> pd.DataFrame:
-        return self.leaderboard()
-
-
-# ── MultiStockRunner (Phase 4) ───────────────────────────────────────────────
-
-class MultiStockRunner:
-    """Run one strategy across many symbols independently."""
-
-    def __init__(self, engine=None, data_manager=None) -> None:
-        self._engine       = engine
-        self._data_manager = data_manager
-
-    def run(
-        self,
-        strategy,
-        symbols: list[str],
-        period:  str   = "1y",
-        capital: float = 100_000.0,
-    ) -> MultiStockResult:
-        """Run strategy on each symbol independently.
-
-        One bad symbol never stops the rest.
-
-        Returns:
-            MultiStockResult with a SymbolResult per symbol.
-        """
-        result = MultiStockResult()
-        strategy_name = getattr(strategy, "name", strategy.__class__.__name__)
-
-        for sym in symbols:
-            log.info(f"[MultiStockRunner] Running {strategy_name} on {sym}...")
-            try:
-                df = self._fetch(sym, period)
-                if df is None or df.empty:
-                    raise ValueError(f"No data returned for {sym}")
-
-                signals = strategy.generate_signals(df)
-                sr = self._compute_metrics(sym, strategy_name, df, signals, capital)
-                result.results[sym] = sr
-
-            except Exception as exc:
-                log.warning(f"[MultiStockRunner] {sym} failed: {exc}")
-                result.results[sym] = SymbolResult(
-                    symbol=sym, strategy=strategy_name, error=str(exc)
-                )
-
-        log.info(
-            f"[MultiStockRunner] Done: {len(result.results)} symbols, "
-            f"{sum(1 for r in result.results.values() if r.ok)} successful."
-        )
-        return result
-
-    def _fetch(self, symbol: str, period: str) -> pd.DataFrame | None:
-        if self._data_manager:
-            return self._data_manager.fetch(symbol, period=period, interval="1d")
-        try:
-            import yfinance as yf
-            df = yf.download(symbol if symbol.endswith(".NS") else symbol + ".NS",
-                             period=period, interval="1d", progress=False)
-            return df
-        except Exception as exc:
-            log.warning(f"[MultiStockRunner] yfinance fetch failed for {symbol}: {exc}")
-            return None
-
-    @staticmethod
-    def _compute_metrics(
-        symbol: str, strategy_name: str,
-        df: pd.DataFrame, signals: pd.Series,
-        capital: float,
-    ) -> SymbolResult:
-        """Compute Sharpe, CAGR, MaxDD, WinRate from signals."""
-        import numpy as np
-
-        closes  = df["Close"].squeeze()
-        returns = closes.pct_change().fillna(0)
-
-        # Strategy returns: 1=long, -1=short, 0=flat
-        strat_returns = signals.shift(1).fillna(0) * returns
-
-        # Sharpe (annualised, 252 trading days)
-        mean  = strat_returns.mean()
-        std   = strat_returns.std()
-        sharpe = (mean / std * (252 ** 0.5)) if std > 0 else 0.0
-
-        # CAGR
-        cum     = (1 + strat_returns).cumprod()
-        n_years = len(df) / 252
-        cagr    = float(cum.iloc[-1] ** (1 / n_years) - 1) if n_years > 0 else 0.0
-
-        # Max drawdown
-        roll_max = cum.cummax()
-        dd       = (cum - roll_max) / roll_max
-        max_dd   = float(dd.min())
-
-        # Win rate
-        trades    = signals[(signals != 0) & (signals != signals.shift(1))]
-        trade_rets = strat_returns[trades.index]
-        win_rate  = float((trade_rets > 0).sum() / len(trade_rets)) if len(trade_rets) else 0.0
-
-        return SymbolResult(
-            symbol=symbol,
-            strategy=strategy_name,
-            total_return=float(cum.iloc[-1] - 1),
-            sharpe=round(sharpe, 3),
-            max_dd=round(max_dd, 4),
-            cagr=round(cagr, 4),
-            win_rate=round(win_rate, 4),
-            trade_count=len(trades),
-        )
-
-
-# ── MultiStrategyRunner (Phase 9) ─────────────────────────────────────────────
 
 @dataclass
 class ConflictRecord:
-    symbol:      str
-    strategies:  list[str]
-    signals:     dict[str, int]   # strategy_name → signal (+1/-1)
-    timestamp:   str = ""
+    symbol:     str
+    bar_ts:     str
+    signals:    dict[str, str]   # {strategy_name: direction}
+    resolution: str = "SKIP"     # always SKIP for now
 
 
-@dataclass
-class MultiStrategyResult:
-    """Result from MultiStrategyRunner.run_all()."""
-    signals:   dict[str, dict[str, int]] = field(default_factory=dict)  # sym → {strat → signal}
-    conflicts: list[ConflictRecord]      = field(default_factory=list)
-    agreed:    dict[str, int]            = field(default_factory=dict)  # sym → consensus signal
-
-    def conflict_count(self) -> int:
-        return len(self.conflicts)
-
-    def agreed_symbols(self) -> list[str]:
-        return [sym for sym, sig in self.agreed.items() if sig != 0]
-
+# ── Runner ────────────────────────────────────────────────────────────────────
 
 class MultiStrategyRunner:
-    """Run multiple strategies on the same symbol universe.
+    """Evaluate multiple strategies per bar; resolve direction conflicts.
 
-    Conflict resolution rule (Phase 9):
-      If two or more strategies signal OPPOSITE directions (+1 vs −1)
-      for the same symbol in the same bar → skip both (signal = 0), log WARNING.
-
-    If all active strategies agree (all +1 or all −1) → forward the consensus signal.
-    If only one strategy has a non-zero signal → forward it.
+    Args:
+        strategies : list of strategy instances (must have .name + .generate_signal)
+        symbols    : list of ticker strings to trade
+        executor   : LiveExecutor or PaperBroker; must have .place_order()
+        session    : "live" | "paper" — passed through to audit
+        max_position_value : ₹ cap per symbol per trade (default 5_000)
     """
 
-    def __init__(self, data_manager=None) -> None:
-        self._data_manager = data_manager
-        self._strategies: list[Any] = []
-
-    def add_strategy(self, strategy) -> None:
-        """Register a strategy instance."""
-        self._strategies.append(strategy)
-        name = getattr(strategy, "name", strategy.__class__.__name__)
-        log.info(f"[MultiStrategyRunner] Registered strategy: {name}")
-
-    def run_all(
+    def __init__(
         self,
+        strategies: list[Strategy],
         symbols: list[str],
-        period:  str = "6mo",
-        interval: str = "5m",
-    ) -> MultiStrategyResult:
-        """Generate signals from all strategies for all symbols.
+        executor: Any,
+        session: str = "live",
+        max_position_value: float = 5_000,
+    ) -> None:
+        self.strategies         = strategies
+        self.symbols            = symbols
+        self.executor           = executor
+        self.session            = session
+        self.max_position_value = max_position_value
+        self.conflict_log: list[ConflictRecord] = []
 
-        Returns MultiStrategyResult with agreed signals and conflict log.
+    # ── Core method ───────────────────────────────────────────────────────────
+
+    def run_once(self, bars: dict[str, dict]) -> dict[str, str | None]:
+        """Evaluate all strategies on the current bar data.
+
+        Args:
+            bars: {symbol: bar_dict}  where bar_dict has at least 'ts', 'close'
+
+        Returns:
+            {symbol: action}  — 'BUY', 'SELL', 'SKIP_CONFLICT', or None
         """
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        IST = ZoneInfo("Asia/Kolkata")
+        results: dict[str, str | None] = {}
 
-        result = MultiStrategyResult()
-
-        for sym in symbols:
-            df = self._fetch(sym, period, interval)
-            if df is None or df.empty:
-                log.warning(f"[MultiStrategyRunner] No data for {sym} — skipping.")
+        for symbol in self.symbols:
+            bar = bars.get(symbol)
+            if bar is None:
+                results[symbol] = None
                 continue
 
-            # Collect latest signal from each strategy
-            sym_signals: dict[str, int] = {}
-            for strat in self._strategies:
-                name = getattr(strat, "name", strat.__class__.__name__)
+            # Collect one signal per strategy
+            signals: dict[str, str] = {}
+            for strat in self.strategies:
                 try:
-                    sig_series = strat.generate_signals(df)
-                    last_sig   = int(sig_series.iloc[-1])
-                    sym_signals[name] = last_sig
+                    sig = strat.generate_signal(symbol, bar)
+                    if sig in ("BUY", "SELL"):
+                        signals[strat.name] = sig
                 except Exception as exc:
-                    log.warning(f"[MultiStrategyRunner] {name} failed on {sym}: {exc}")
-                    sym_signals[name] = 0
+                    log.warning(f"[multi_runner] {strat.name} error on {symbol}: {exc}")
 
-            result.signals[sym] = sym_signals
-
-            # ─ Conflict resolution ─────────────────────────────────────────────────
-            active = {k: v for k, v in sym_signals.items() if v != 0}
-
-            if not active:
-                result.agreed[sym] = 0
+            if not signals:
+                results[symbol] = None
                 continue
 
-            unique_directions = set(active.values())
+            directions = set(signals.values())
 
-            if len(unique_directions) > 1:
-                # Conflict: strategies disagree on direction
-                conflicting = [k for k, v in active.items()]
-                log.warning(
-                    f"[MultiStrategyRunner] CONFLICT on {sym}: "
-                    + ", ".join(f"{k}={v:+d}" for k, v in active.items())
-                    + " — skipping all orders for this symbol."
-                )
-                result.conflicts.append(ConflictRecord(
-                    symbol=sym,
-                    strategies=conflicting,
-                    signals=dict(active),
-                    timestamp=datetime.now(tz=IST).isoformat(),
-                ))
-                result.agreed[sym] = 0   # skip
+            # Conflict: two or more strategies disagree
+            if len(directions) > 1:
+                self._handle_conflict(symbol, bar, signals)
+                results[symbol] = "SKIP_CONFLICT"
+                continue
 
-            else:
-                # All active strategies agree
-                consensus = list(unique_directions)[0]
-                result.agreed[sym] = consensus
-                log.info(
-                    f"[MultiStrategyRunner] {sym}: consensus signal={consensus:+d} "
-                    f"from {list(active.keys())}"
-                )
+            # All strategies agree — use the consensus direction
+            direction = directions.pop()
+            results[symbol] = direction
+            self._execute(symbol, direction, bar)
 
-        log.info(
-            f"[MultiStrategyRunner] Done: {len(symbols)} symbols, "
-            f"{len(result.agreed_symbols())} actionable, "
-            f"{result.conflict_count()} conflicts skipped."
+        return results
+
+    # ── Conflict handler ──────────────────────────────────────────────────────
+
+    def _handle_conflict(self, symbol: str, bar: dict,
+                         signals: dict[str, str]) -> None:
+        """Log and skip a conflicted symbol."""
+        bar_ts = str(bar.get("ts", ""))
+        rec = ConflictRecord(
+            symbol=symbol,
+            bar_ts=bar_ts,
+            signals=signals,
+            resolution="SKIP",
         )
-        return result
+        self.conflict_log.append(rec)
+        log.info(
+            f"[multi_runner] ⚡ CONFLICT skipped — {symbol} @ {bar_ts} "
+            f"signals={signals}"
+        )
+        audit.record(
+            "CONFLICT_SKIP",
+            symbol,
+            session=self.session,
+            bar_ts=bar_ts,
+            signals=signals,
+            resolution="SKIP",
+        )
 
-    def _fetch(self, symbol: str, period: str, interval: str) -> pd.DataFrame | None:
-        if self._data_manager:
-            return self._data_manager.fetch(symbol, period=period, interval=interval)
+    # ── Trade execution ───────────────────────────────────────────────────────
+
+    def _execute(self, symbol: str, direction: str, bar: dict) -> None:
+        """Place order via executor if position value cap allows."""
+        ltp = float(bar.get("close", 0))
+        if ltp <= 0:
+            log.warning(f"[multi_runner] {symbol}: zero LTP — skipping order.")
+            return
+
+        qty = max(1, int(self.max_position_value // ltp))
+        log.info(
+            f"[multi_runner] → {direction} {qty}x {symbol} @ ₹{ltp:,.2f} "
+            f"(pos_val≈₹{qty*ltp:,.0f})"
+        )
         try:
-            import yfinance as yf
-            sym = symbol if symbol.endswith(".NS") else symbol + ".NS"
-            return yf.download(sym, period=period, interval=interval, progress=False)
+            self.executor.place_order(
+                symbol=symbol,
+                side=direction,
+                qty=qty,
+                order_type="MARKET",
+                session=self.session,
+            )
         except Exception as exc:
-            log.warning(f"[MultiStrategyRunner] fetch failed for {symbol}: {exc}")
-            return None
+            log.error(f"[multi_runner] place_order failed for {symbol}: {exc}")
+
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+
+    def conflict_summary(self) -> dict:
+        """Return counts of conflicts per symbol since last reset."""
+        summary: dict[str, int] = {}
+        for rec in self.conflict_log:
+            summary[rec.symbol] = summary.get(rec.symbol, 0) + 1
+        return summary
+
+    def reset_conflict_log(self) -> None:
+        self.conflict_log.clear()

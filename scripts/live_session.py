@@ -1,61 +1,55 @@
-"""Live trading session bootstrap — Phase 9.
+"""Live trading session entry point.
 
-Entry point for each trading day. Run once at market open:
+Flow (each trading day):
+  1. Validate env vars (EAGLE_LIVE_ENABLED, broker credentials)
+  2. executor.connect()  — establish broker WebSocket
+  3. executor.reconcile() — sync internal book with broker
+  4. scheduler.start()   — pre-market 09:00, open 09:15, close 15:20, report 15:35
+  5. Register SIGTERM / SIGINT → graceful_shutdown() → square off all positions
 
-    EAGLE_LIVE_ENABLED=true python scripts/live_session.py
+Usage:
+    python scripts/live_session.py
+    python scripts/live_session.py --symbol NIFTYBEES --strategy sma_crossover
 
-Flow:
-    1. Validate all env vars
-    2. executor.connect()  — credentials + token map + reconcile
-    3. executor.reconcile() — confirm 0 discrepancies before first order
-    4. Start scheduler:
-           09:00  pre_market_check()
-           09:15  market_open()     ← strategy signals start here
-           15:20  market_close()    ← square off open positions
-           15:35  post_market_report()
-    5. SIGTERM / SIGINT → graceful_shutdown() → square off all + audit summary
-
-First instrument: NIFTYBEES (NIFTY ETF)
-    - Highly liquid (millions of shares/day)
-    - No F&O complexity
-    - Tracks NIFTY index cleanly
-    - max_position_value = ₹5,000
-    - Strategy: SMA Crossover (20, 50) on 5m data
-    - Paper portfolio runs in parallel — signals must match
+First-live defaults (P1 task):
+    symbol   = NIFTYBEES
+    strategy = sma_crossover (20, 50)
+    max_position_value = ₹5,000
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import signal
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# ── Project root on path ───────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from core.audit import audit
-from core.logger import get_logger
-from live.executor import LIVE_ENABLED, DuplicateOrderError, LiveExecutor
-
-log = get_logger("live_session")
 IST = ZoneInfo("Asia/Kolkata")
 
-# ── Config ───────────────────────────────────────────────────────────────
-FIRST_SYMBOLS   = ["NIFTYBEES"]                   # Week 1: ETF only
-EXPANDED_SYMBOLS = ["NIFTYBEES", "RELIANCE", "HDFCBANK", "INFY", "TCS"]  # After 5 clean days
-MAX_POSITION_VALUE = 5_000                         # ₹5,000 hard cap per position
-STRATEGY_NAME   = "SMA Crossover"
-STRATEGY_PARAMS = {"fast": 20, "slow": 50}
-INTERVAL        = "5m"
+# ── Logging setup (before any eagle imports) ──────────────────────────────────
+from core.logger import get_logger
+log = get_logger("scripts.live_session")
 
-# ── Required env vars (validated before anything runs) ─────────────────────
-REQUIRED_VARS = [
+# ── Constants ─────────────────────────────────────────────────────────────────
+DEFAULT_SYMBOL    = "NIFTYBEES"
+DEFAULT_STRATEGY  = "sma_crossover"
+DEFAULT_MAX_POS   = 5_000          # ₹ — Phase 09 Week-1 cap
+
+# Market schedule (IST)
+PRE_MARKET_HH_MM  = (9, 0)
+MARKET_OPEN_HH_MM = (9, 15)
+MARKET_CLOSE_HH_MM= (15, 20)
+POST_MARKET_HH_MM = (15, 35)
+
+_executor = None   # global so signal handler can reach it
+
+
+# ── Step 1: Environment validation ────────────────────────────────────────────
+
+REQUIRED_ENV_VARS = [
     "ANGEL_API_KEY",
     "ANGEL_CLIENT_ID",
     "ANGEL_PASSWORD",
@@ -63,337 +57,228 @@ REQUIRED_VARS = [
     "EAGLE_LIVE_ENABLED",
 ]
 
-# ── Globals ────────────────────────────────────────────────────────────────
-executor: LiveExecutor | None = None
-_shutdown_requested = False
-
-
-# ── Step 1: Validate env vars ─────────────────────────────────────────────
-
 def validate_env() -> None:
-    """Fail loudly listing every missing var before any network call."""
-    missing = [v for v in REQUIRED_VARS if not os.environ.get(v, "").strip()]
+    """Abort if any required env var is missing or EAGLE_LIVE_ENABLED != true."""
+    missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
     if missing:
-        raise ValueError(
-            f"\n[live_session] Missing required environment variables:\n"
-            + "\n".join(f"  ✗  {v}" for v in missing)
-            + "\n\nAdd them to your .env file and restart."
+        log.error(f"[live_session] Missing env vars: {missing}")
+        sys.exit(1)
+
+    if os.getenv("EAGLE_LIVE_ENABLED", "false").lower() != "true":
+        log.error(
+            "[live_session] EAGLE_LIVE_ENABLED is not 'true'. "
+            "Set it explicitly to enable live trading."
         )
-    if not LIVE_ENABLED:
-        raise RuntimeError(
-            "EAGLE_LIVE_ENABLED is not 'true'. "
-            "Set EAGLE_LIVE_ENABLED=true in .env ONLY after paper validation."
-        )
-    log.info("[live_session] ✓ All env vars present.")
+        sys.exit(1)
+
+    log.info("[live_session] ✅ Env validation passed.")
 
 
-# ── Scheduled jobs ───────────────────────────────────────────────────────────
+# ── Step 2–3: Connect + reconcile ─────────────────────────────────────────────
 
-def pre_market_check() -> None:
-    """09:00 IST — Warm-up checks before market opens."""
-    log.info("[09:00] Pre-market check starting...")
-    audit.record("PRE_MARKET_START", "SYSTEM", session="live")
+def connect_and_reconcile(executor) -> None:
+    log.info("[live_session] Connecting to broker…")
+    executor.connect()
+    log.info("[live_session] ✅ Broker connected.")
 
-    # Refresh token map
+    log.info("[live_session] Running reconcile…")
+    discrepancies = executor.reconcile()
+    if discrepancies:
+        log.warning(f"[live_session] ⚠️ {len(discrepancies)} reconcile discrepancies: {discrepancies}")
+    else:
+        log.info("[live_session] ✅ Reconcile clean — 0 discrepancies.")
+
+    from core.audit import audit
+    audit.record("SESSION_START", "SYSTEM", session="live",
+                 reconcile_discrepancies=len(discrepancies) if discrepancies else 0)
+
+
+# ── Step 4: Scheduler ─────────────────────────────────────────────────────────
+
+def _wait_until(hh: int, mm: int, label: str) -> None:
+    """Block until IST wall-clock reaches hh:mm. Logs every 5 min."""
+    while True:
+        now = datetime.now(tz=IST)
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        delta  = (target - now).total_seconds()
+        if delta <= 0:
+            return
+        if delta > 300:
+            log.info(f"[live_session] ⏳ Waiting for {label} ({int(delta//60)}m remaining)…")
+        time.sleep(min(delta, 60))
+
+
+def pre_market_check(executor, symbol: str) -> None:
+    """09:00 — validate positions, print margin, warm data cache."""
+    log.info("[live_session] 🌅 Pre-market check started (09:00 IST).")
+    positions = executor.get_positions()
+    log.info(f"[live_session]   Overnight positions: {len(positions)}")
+    for p in positions:
+        log.info(f"[live_session]     {p}")
+    from core.audit import audit
+    audit.record("PRE_MARKET", symbol, session="live",
+                 overnight_positions=len(positions))
+
+
+def market_open(executor, symbol: str, strategy_name: str,
+                max_position_value: float) -> None:
+    """09:15 — start strategy execution loop."""
+    log.info("[live_session] 🔔 Market open (09:15 IST) — starting strategy.")
     try:
-        from instruments.token_map import refresh_if_stale, token_count
-        refresh_if_stale()
-        log.info(f"[09:00] Token map: {token_count()} instruments ready.")
+        from engine.runner import StrategyRunner
+        runner = StrategyRunner(
+            symbol=symbol,
+            strategy_name=strategy_name,
+            executor=executor,
+            max_position_value=max_position_value,
+            session="live",
+        )
+        runner.start()   # non-blocking; runs in background thread
+        log.info(f"[live_session] ✅ Strategy '{strategy_name}' running on {symbol}.")
+    except ImportError:
+        log.warning("[live_session] StrategyRunner not yet wired — strategy loop skipped.")
     except Exception as exc:
-        log.error(f"[09:00] Token map refresh failed: {exc}")
-        audit.record("PRE_MARKET_ERROR", "SYSTEM", session="live", error=str(exc))
-
-    # Final reconcile before trading begins
-    if executor:
-        result = executor.reconcile()
-        if any(result.values()):
-            log.warning(f"[09:00] Reconcile discrepancies found: {result}")
-            audit.record("PRE_MARKET_RECONCILE_WARN", "SYSTEM", session="live",
-                         discrepancies=result)
-        else:
-            log.info("[09:00] ✓ Reconcile: 0 discrepancies.")
-
-    audit.record("PRE_MARKET_DONE", "SYSTEM", session="live")
+        log.error(f"[live_session] Strategy start failed: {exc}")
 
 
-def market_open() -> None:
-    """09:15 IST — Market opens: begin signal generation loop."""
-    log.info("[09:15] Market open. Starting signal loop...")
-    audit.record("MARKET_OPEN", "SYSTEM", session="live")
+def market_close(executor, symbol: str) -> None:
+    """15:20 — square off all intraday positions before exchange closes."""
+    log.info("[live_session] 🔔 Market close (15:20 IST) — squaring off positions.")
+    try:
+        executor.square_off_all(reason="EOD_CLOSE")
+        log.info("[live_session] ✅ All positions squared off.")
+    except Exception as exc:
+        log.error(f"[live_session] Square-off failed: {exc}")
 
-    # Determine active symbols
-    symbols = _get_active_symbols()
-    log.info(f"[09:15] Active symbols: {symbols}")
 
-    # Start strategy in background thread
-    import threading
-    t = threading.Thread(
-        target=_signal_loop,
-        args=(symbols,),
-        daemon=True,
-        name="signal_loop",
+def post_market_report(executor, audit_log=None) -> None:
+    """15:35 — reconcile, write daily summary, disconnect."""
+    log.info("[live_session] 📋 Post-market report (15:35 IST).")
+    try:
+        discrepancies = executor.reconcile()
+    except Exception:
+        discrepancies = []
+
+    from core.audit import audit as _audit
+    al = audit_log or _audit
+    events = al.today(session="live")
+    trades = [e for e in events if e.get("event") == "ORDER_PLACED"]
+    pnl    = sum(float(e.get("pnl", 0)) for e in events if "pnl" in e)
+    max_pos = max(
+        (abs(int(e.get("qty", 0))) * float(e.get("price", 0)) for e in trades),
+        default=0.0,
     )
-    t.start()
 
-
-def market_close() -> None:
-    """15:20 IST — Square off all open positions before exchange close."""
-    global _shutdown_requested
-    log.info("[15:20] Market close: squaring off all positions...")
-    audit.record("MARKET_CLOSE_SQUAREOFF", "SYSTEM", session="live")
-    _square_off_all(reason="EOD")
-    _shutdown_requested = True
-
-
-def post_market_report() -> None:
-    """15:35 IST — Write daily summary to audit log."""
-    log.info("[15:35] Post-market report...")
-    today_events   = audit.today(session="live")
-    trades         = [e for e in today_events if e.get("event") == "ORDER_PLACED"]
-    reconciles     = [e for e in today_events if "RECONCILE" in e.get("event", "")]
-    discrepancies  = [e for e in reconciles if e.get("event") != "RECONCILE_NONE"]
-
-    total_pnl = sum(float(e.get("pnl", 0)) for e in today_events if "pnl" in e)
-
-    # Position values
-    pos_values: list[float] = []
-    if executor:
-        for pos in executor.get_positions():
-            qty   = abs(int(pos.get("netqty", 0)))
-            price = float(pos.get("ltp", 0))
-            pos_values.append(qty * price)
-    max_position = max(pos_values) if pos_values else 0.0
-
-    audit.daily_summary(
+    al.daily_summary(
         session="live",
         total_trades=len(trades),
-        total_pnl=round(total_pnl, 2),
-        max_position_value=round(max_position, 2),
-        reconcile_discrepancies=len(discrepancies),
+        total_pnl=pnl,
+        max_position_value=max_pos,
+        reconcile_discrepancies=len(discrepancies) if discrepancies else 0,
     )
     log.info(
-        f"[15:35] Day summary — trades={len(trades)} pnl={total_pnl:.2f} "
-        f"max_pos={max_position:.2f} discrepancies={len(discrepancies)}"
+        f"[live_session] Daily summary — trades={len(trades)} "
+        f"pnl=₹{pnl:.2f} reconcile_issues={len(discrepancies) if discrepancies else 0}"
     )
 
 
-# ── Signal loop ─────────────────────────────────────────────────────────────────
+def run_scheduler(executor, symbol: str, strategy_name: str,
+                  max_position_value: float) -> None:
+    """Block through the full trading day schedule."""
+    _wait_until(*PRE_MARKET_HH_MM, "Pre-market (09:00)")
+    pre_market_check(executor, symbol)
 
-def _signal_loop(symbols: list[str]) -> None:
-    """Runs in background thread 09:15 – 15:20.
+    _wait_until(*MARKET_OPEN_HH_MM, "Market open (09:15)")
+    market_open(executor, symbol, strategy_name, max_position_value)
 
-    Every bar (5m), fetch data, generate signals, compare with paper portfolio,
-    place live orders only if paper and live agree.
-    """
-    from data.fetcher import DataFetcher
-    from paper.portfolio import PaperPortfolio
-    from strategies.sma_crossover import SMACrossover
+    _wait_until(*MARKET_CLOSE_HH_MM, "Market close (15:20)")
+    market_close(executor, symbol)
 
-    fetcher         = DataFetcher()
-    live_strategy   = SMACrossover(**STRATEGY_PARAMS)
-    paper_strategy  = SMACrossover(**STRATEGY_PARAMS)
-    paper_portfolio = PaperPortfolio(capital=len(symbols) * MAX_POSITION_VALUE)
-
-    log.info(f"[signal_loop] Started: symbols={symbols} interval={INTERVAL}")
-
-    while not _shutdown_requested:
-        now = datetime.now(tz=IST)
-        # Only trade during market hours
-        if not (now.hour == 9 and now.minute >= 15) and not (9 < now.hour < 15) and not (now.hour == 15 and now.minute < 20):
-            time.sleep(30)
-            continue
-
-        for sym in symbols:
-            try:
-                df = fetcher.fetch(sym, period="5d", interval=INTERVAL)
-                if df is None or df.empty:
-                    log.warning(f"[signal_loop] No data for {sym}")
-                    continue
-
-                # Live signal
-                live_sig = live_strategy.generate_signals(df).iloc[-1]
-                # Paper signal (must match)
-                paper_sig = paper_strategy.generate_signals(df).iloc[-1]
-
-                if live_sig != paper_sig:
-                    log.warning(
-                        f"[signal_loop] SIGNAL MISMATCH {sym}: "
-                        f"live={live_sig} paper={paper_sig}. Skipping live order."
-                    )
-                    audit.record("SIGNAL_MISMATCH", sym, session="live",
-                                 live_signal=int(live_sig), paper_signal=int(paper_sig))
-                    continue
-
-                ltp   = float(df["Close"].iloc[-1])
-                qty   = max(1, int(MAX_POSITION_VALUE // ltp))
-
-                if live_sig == 1:
-                    _place_safe(sym, "BUY", qty, ltp)
-                    paper_portfolio.on_signal("BUY", sym, ltp, qty)
-                elif live_sig == -1:
-                    _place_safe(sym, "SELL", qty, ltp)
-                    paper_portfolio.on_signal("SELL", sym, ltp, qty)
-
-            except Exception as exc:
-                log.error(f"[signal_loop] Error processing {sym}: {exc}")
-                audit.record("SIGNAL_LOOP_ERROR", sym, session="live", error=str(exc))
-
-        # Wait for next 5m bar
-        time.sleep(300)
+    _wait_until(*POST_MARKET_HH_MM, "Post-market report (15:35)")
+    post_market_report(executor)
 
 
-def _place_safe(
-    symbol: str, side: str, qty: int, price: float,
-) -> None:
-    """Place order with idempotency and position value guard."""
-    if executor is None:
-        return
-    # ₹5,000 position value guard
-    if qty * price > MAX_POSITION_VALUE:
-        qty = max(1, int(MAX_POSITION_VALUE // price))
+# ── Step 5: Signal handlers ────────────────────────────────────────────────────
 
-    ts = datetime.now(tz=IST).isoformat()
-    try:
-        executor.place_order(
-            symbol=symbol, side=side, qty=qty, price=price,
-            signal_timestamp=ts,
-        )
-    except DuplicateOrderError:
-        log.info(f"[place_safe] Duplicate blocked: {side} {symbol}")
-    except Exception as exc:
-        log.error(f"[place_safe] Order failed [{symbol}]: {exc}")
+def graceful_shutdown(signum, frame) -> None:  # noqa: ANN001
+    """SIGTERM / SIGINT → square off all positions and exit cleanly."""
+    global _executor
+    sig_name = signal.Signals(signum).name
+    log.warning(f"[live_session] 🛑 Received {sig_name} — initiating graceful shutdown.")
 
+    from core.audit import audit
+    audit.record("SHUTDOWN_SIGNAL", "SYSTEM", session="live", signal=sig_name)
 
-# ── Square off ───────────────────────────────────────────────────────────────────
-
-def _square_off_all(reason: str = "SHUTDOWN") -> None:
-    """Square off every open position at market price."""
-    if executor is None:
-        return
-    positions = executor.get_positions()
-    if not positions:
-        log.info(f"[square_off] No open positions to square off ({reason}).")
-        return
-    for pos in positions:
-        sym = str(pos.get("tradingsymbol", "")).upper()
-        qty = abs(int(pos.get("netqty", 0)))
-        if qty == 0:
-            continue
-        # If long → sell; if short → buy
-        net = int(pos.get("netqty", 0))
-        side = "SELL" if net > 0 else "BUY"
+    if _executor is not None:
         try:
-            executor.place_order(
-                symbol=sym, side=side, qty=qty,
-                signal_timestamp=f"SQUAREOFF_{reason}_{datetime.now(tz=IST).isoformat()}",
-            )
-            log.info(f"[square_off] {side} {qty} {sym} ({reason})")
-            audit.record("SQUARE_OFF", sym, session="live",
-                         side=side, qty=qty, reason=reason)
+            log.warning("[live_session] Squaring off all positions before exit…")
+            _executor.square_off_all(reason=f"SHUTDOWN_{sig_name}")
+            log.info("[live_session] ✅ All positions squared off.")
         except Exception as exc:
-            log.error(f"[square_off] Failed {sym}: {exc}")
-            audit.record("SQUARE_OFF_ERROR", sym, session="live",
-                         error=str(exc), reason=reason)
+            log.error(f"[live_session] Square-off on shutdown failed: {exc}")
+        try:
+            _executor.disconnect()
+        except Exception:
+            pass
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _get_active_symbols() -> list[str]:
-    """Return symbol list based on how many clean days have passed."""
-    clean_days = int(os.environ.get("EAGLE_CLEAN_DAYS", "0"))
-    if clean_days >= 5:
-        return EXPANDED_SYMBOLS
-    return FIRST_SYMBOLS
-
-
-# ── Graceful shutdown ────────────────────────────────────────────────────────────
-
-def graceful_shutdown(signum=None, frame=None) -> None:
-    """SIGTERM / SIGINT handler.
-
-    1. Square off all open positions
-    2. Write post-market report
-    3. Exit cleanly
-    """
-    global _shutdown_requested
-    _shutdown_requested = True
-    log.info(f"[shutdown] Signal {signum} received. Initiating graceful shutdown...")
-    audit.record("SHUTDOWN_REQUESTED", "SYSTEM", session="live", signum=signum)
-
-    _square_off_all(reason="SIGTERM")
-    post_market_report()
-
-    log.info("[shutdown] Done. Exiting.")
+    log.info("[live_session] Goodbye. 🦅")
     sys.exit(0)
 
 
-# ── Scheduler ───────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
-def _run_scheduler() -> None:
-    """Simple scheduler: checks HH:MM every 30s and fires jobs once per day."""
-    JOBS = {
-        "09:00": pre_market_check,
-        "09:15": market_open,
-        "15:20": market_close,
-        "15:35": post_market_report,
-    }
-    fired: set[str] = set()
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Eagle live trading session")
+    p.add_argument("--symbol",   default=DEFAULT_SYMBOL,
+                   help=f"Symbol to trade (default: {DEFAULT_SYMBOL})")
+    p.add_argument("--strategy", default=DEFAULT_STRATEGY,
+                   help=f"Strategy name (default: {DEFAULT_STRATEGY})")
+    p.add_argument("--max-pos",  type=float, default=DEFAULT_MAX_POS,
+                   help=f"Max position value ₹ (default: {DEFAULT_MAX_POS})")
+    return p.parse_args()
 
-    log.info("[scheduler] Running. Waiting for market events...")
-    while not _shutdown_requested:
-        now_hm = datetime.now(tz=IST).strftime("%H:%M")
-        for hm, job in JOBS.items():
-            if now_hm == hm and hm not in fired:
-                log.info(f"[scheduler] Firing job at {hm}: {job.__name__}")
-                try:
-                    job()
-                except Exception as exc:
-                    log.error(f"[scheduler] Job {job.__name__} failed: {exc}")
-                    audit.record("SCHEDULER_JOB_ERROR", "SYSTEM", session="live",
-                                 job=job.__name__, error=str(exc))
-                fired.add(hm)
-        # Reset fired jobs at midnight
-        if now_hm == "00:00":
-            fired.clear()
-        time.sleep(30)
-
-
-# ── Entry point ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global executor
+    global _executor
 
-    log.info("=" * 60)
-    log.info(" EAGLE LIVE SESSION STARTING")
-    log.info(f" Date: {datetime.now(tz=IST).strftime('%Y-%m-%d %H:%M IST')}")
-    log.info("=" * 60)
+    args = parse_args()
+    log.info(
+        f"[live_session] 🚀 Starting Eagle Live Session — "
+        f"symbol={args.symbol} strategy={args.strategy} max_pos=₹{args.max_pos:,.0f}"
+    )
 
-    # 1. Validate env vars
+    # 1. Validate env
     validate_env()
 
-    # 2. Connect to broker (validates creds + token map + reconcile internally)
-    executor = LiveExecutor()
-    executor.connect()
-    log.info("[main] ✓ Broker connection established.")
+    # 2. Build executor
+    try:
+        from live.executor import LiveExecutor
+        _executor = LiveExecutor()
+    except Exception as exc:
+        log.error(f"[live_session] Could not create LiveExecutor: {exc}")
+        sys.exit(1)
 
-    # 3. Pre-flight reconcile
-    result = executor.reconcile()
-    if any(result.values()):
-        log.warning(f"[main] Pre-flight reconcile found discrepancies: {result}")
-        log.warning("[main] Review and resolve before relying on position data.")
-    else:
-        log.info("[main] ✓ Pre-flight reconcile: 0 discrepancies.")
-
-    # 4. Register signal handlers
+    # 3. Signal handlers
     signal.signal(signal.SIGTERM, graceful_shutdown)
     signal.signal(signal.SIGINT,  graceful_shutdown)
-    log.info("[main] ✓ Signal handlers registered (SIGTERM, SIGINT).")
 
-    # 5. Run scheduler (blocks until 15:35 or SIGTERM)
-    audit.record("SESSION_READY", "SYSTEM", session="live",
-                 symbols=_get_active_symbols(),
-                 max_position_value=MAX_POSITION_VALUE)
-    _run_scheduler()
+    # 4. Connect + reconcile
+    connect_and_reconcile(_executor)
+
+    # 5. Run day scheduler (blocks until 15:35)
+    run_scheduler(
+        executor=_executor,
+        symbol=args.symbol,
+        strategy_name=args.strategy,
+        max_position_value=args.max_pos,
+    )
+
+    # 6. Disconnect cleanly
+    try:
+        _executor.disconnect()
+    except Exception:
+        pass
+    log.info("[live_session] ✅ Session complete. 🦅")
 
 
 if __name__ == "__main__":
