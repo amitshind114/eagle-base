@@ -15,6 +15,7 @@ Optionally implement:
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -78,8 +79,30 @@ class BaseStrategy(ABC):
         Called by StrategyRegistry before instantiating with custom params.
         Override to add strategy-specific validation.
 
-        Default: always True (no validation).
+        Base checks (applied before subclass logic):
+          - If params has 'fast' and 'slow': fast > 0, slow > 0, fast < slow
+          - If params has 'period': period > 2
+
+        These catch common mistakes like SmaCrossover(fast=50, slow=20)
+        before the backtest runs and wastes compute.
         """
+        # Base guard: fast/slow crossover params
+        if "fast" in params and "slow" in params:
+            fast = params["fast"]
+            slow = params["slow"]
+            if not (isinstance(fast, (int, float)) and fast > 0):
+                return False
+            if not (isinstance(slow, (int, float)) and slow > 0):
+                return False
+            if fast >= slow:
+                return False
+
+        # Base guard: single period param
+        if "period" in params:
+            period = params["period"]
+            if not (isinstance(period, (int, float)) and period > 2):
+                return False
+
         return True
 
     # ── Optional ────────────────────────────────────────────────────────────
@@ -93,7 +116,7 @@ class BaseStrategy(ABC):
 
         Keys: win_rate, avg_win_pct, avg_loss_pct
         Strategies that override this get automatic position sizing.
-        Those that don\'t fall back to 1% risk per trade.
+        Those that don't fall back to 1% risk per trade.
         """
         return {}
 
@@ -147,7 +170,10 @@ class BaseStrategy(ABC):
 
 # Module-level registry dict — populated by @register_strategy on import.
 # StrategyRegistry reads from this at startup.
+# Protected by a Lock so MultiStockRunner ThreadPoolExecutor concurrent imports
+# cannot cause a race condition on the dict.
 _STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {}
+_REGISTRY_LOCK = threading.Lock()
 
 
 def register_strategy(cls: type[BaseStrategy]) -> type[BaseStrategy]:
@@ -162,8 +188,12 @@ def register_strategy(cls: type[BaseStrategy]) -> type[BaseStrategy]:
     Effect:
         strategies.base._STRATEGY_REGISTRY["EMA Crossover"] = EmaCrossover
 
+    Thread-safe: uses _REGISTRY_LOCK so concurrent imports from
+    MultiStockRunner ThreadPoolExecutor cannot corrupt the dict.
+
     The decorator is a pure passthrough — it never modifies the class.
     Existing code that uses EmaCrossover directly is completely unaffected.
     """
-    _STRATEGY_REGISTRY[cls.name] = cls
+    with _REGISTRY_LOCK:
+        _STRATEGY_REGISTRY[cls.name] = cls
     return cls

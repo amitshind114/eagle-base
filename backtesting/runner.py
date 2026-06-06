@@ -1,7 +1,14 @@
-"""Backtest Runner — Priority 3.
+"""Backtest Runner — Phase 02/03 updated.
 
 High-level interface that wires DataManager + BacktestEngine + Strategy.
 Use this as the single entry point for running backtests.
+
+Changes in Phase 03:
+  - interval is now passed to BacktestEngine so Sharpe uses correct
+    annualisation periods (PERIODS dict).  Previously interval was stored
+    on the runner but never forwarded to the engine — causing every
+    non-daily backtest to use np.sqrt(252) regardless of timeframe.
+  - product_type param added and forwarded to engine for correct STT.
 
 Usage:
     from backtesting.runner import BacktestRunner
@@ -45,23 +52,28 @@ class BacktestRunner:
         capital: float = 100_000.0,
         commission_pct: float = 0.0003,
         slippage_pct: float = 0.0001,
+        product_type: str = "CNC",
         data: Optional[pd.DataFrame] = None,
     ):
-        self.strategy = strategy
-        self.symbol = symbol
-        self.from_date = from_date
-        self.to_date = to_date
-        self.interval = interval
-        self.capital = capital
+        self.strategy       = strategy
+        self.symbol         = symbol
+        self.from_date      = from_date
+        self.to_date        = to_date
+        self.interval       = interval
+        self.capital        = capital
         self.commission_pct = commission_pct
-        self.slippage_pct = slippage_pct
-        self._data = data  # Pre-loaded data (optional)
+        self.slippage_pct   = slippage_pct
+        self.product_type   = product_type
+        self._data          = data  # Pre-loaded data (optional)
 
     def run(self) -> "BacktestResult":
         """Fetch data (if needed) and run backtest.
 
         Returns:
-            BacktestResult with trades, equity curve, metrics
+            BacktestResult with trades, equity curve, metrics.
+
+        Phase 03 fix: interval and product_type are now forwarded to
+        BacktestEngine so Sharpe annualisation and STT are correct.
         """
         df = self._load_data()
         if df.empty:
@@ -72,8 +84,27 @@ class BacktestRunner:
             initial_capital=self.capital,
             commission_pct=self.commission_pct,
             slippage_pct=self.slippage_pct,
+            interval=self.interval,       # FIX: was not forwarded — broke Sharpe on intraday
+            product_type=self.product_type,  # FIX: was not forwarded — wrong STT for delivery
         )
-        return engine.run(df, self.strategy)
+        result = engine.run(df, self.strategy)
+
+        # Phase 03: update strategy metadata with realised win/loss metrics
+        # so sized_qty() has accurate inputs next time it is called.
+        # avg_win_pct and avg_loss_pct from BacktestResult are already
+        # expressed as fraction-of-trade (e.g. 0.04 = 4%), not % of capital.
+        # Pass them directly to sizer — no conversion needed.
+        try:
+            m = self.strategy.metadata()
+            if not m:  # strategy hasn't overridden metadata() — update dynamically
+                if result.total_trades > 0:
+                    self.strategy._realised_win_rate   = result.win_rate_pct / 100.0
+                    self.strategy._realised_avg_win    = result.avg_win_pct   # already decimal
+                    self.strategy._realised_avg_loss   = result.avg_loss_pct  # already decimal
+        except Exception:
+            pass  # non-critical — sizer falls back to defaults
+
+        return result
 
     def _load_data(self) -> pd.DataFrame:
         if self._data is not None:
