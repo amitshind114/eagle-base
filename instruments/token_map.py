@@ -1,25 +1,26 @@
-"""Angel One instrument token map — Phase 8 Live Safety.
+"""Instrument token map — equity + F&O.
 
-Maps NSE symbols to Angel One instrument tokens required for order placement.
-Token map is cached locally so live orders never fail due to a missing token.
+Maps human-readable symbols to Angel One token IDs for live order placement.
+
+Coverage:
+    NSE Equity  : {"RELIANCE": "2885", "INFY": "1594", ...}
+    NSE F&O     : {"NIFTY24DEC21500CE": "tokenid", ...}
+
+Expiry helpers:
+    get_near_expiry(symbol)  → nearest weekly/monthly expiry date string
+    get_all_expiries(symbol) → sorted list of all available expiry dates
 
 Usage:
-    from instruments.token_map import get_token, refresh_if_stale
+    from instruments.token_map import get_token, get_near_expiry
 
     token = get_token("RELIANCE")          # "2885"
-    token = get_token("TCS")               # "11536"
-    refresh_if_stale()                     # no-op if cache < 24h old
-
-Raises:
-    ValueError  : symbol not found in token map after refresh
-    RuntimeError: SmartAPI unavailable AND no local cache exists
+    token = get_token("NIFTY24DEC21500CE") # F&O token
+    expiry = get_near_expiry("NIFTY")      # "2026-07-03"
 """
 
 from __future__ import annotations
 
-import json
-import os
-import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -27,189 +28,181 @@ from core.logger import get_logger
 
 log = get_logger("instruments.token_map")
 
-# ── Cache location ────────────────────────────────────────────────────────────
-_CACHE_DIR  = Path(os.environ.get("EAGLE_DATA_DIR", "eagle_base/data"))
-_CACHE_FILE = _CACHE_DIR / "token_map.json"
-_TTL_SECS   = 86_400  # 24 hours
+__all__ = [
+    "get_token",
+    "get_exchange",
+    "get_near_expiry",
+    "get_all_expiries",
+    "refresh_from_db",
+    "TokenMap",
+]
 
-# In-memory store: {"RELIANCE": "2885", ...}
-_token_map: dict[str, str] = {}
-_loaded_at: float = 0.0
 
+# ════════════════════════════════════════════════════════════════════════════
+# TokenMap class
+# ════════════════════════════════════════════════════════════════════════════
 
-# ── Download from Angel One SmartAPI ─────────────────────────────────────────
+class TokenMap:
+    """In-memory token map loaded from instruments SQLite DB.
 
-def download_instrument_master() -> dict[str, str]:
-    """Fetch NSE instrument list from Angel One SmartAPI.
-
-    Returns:
-        dict mapping SYMBOL (str) → token (str)
-
-    Raises:
-        RuntimeError: if SmartAPI is not installed or call fails.
+    Loads both NSE equity AND NSE F&O (NFO) tokens in one pass.
+    Re-loadable at any time by calling .refresh().
     """
-    try:
-        from SmartApi import SmartConnect  # pip install smartapi-python
-    except ImportError as exc:
-        raise RuntimeError(
-            "smartapi-python not installed. "
-            "Run: pip install smartapi-python"
-        ) from exc
 
-    api_key = os.environ.get("ANGEL_API_KEY", "")
-    if not api_key:
-        raise RuntimeError(
-            "ANGEL_API_KEY env var not set. "
-            "Cannot download instrument master without credentials."
-        )
+    def __init__(self) -> None:
+        # { symbol_upper: {"token": str, "exchange": str, "expiry": str|None, ...} }
+        self._map: dict[str, dict] = {}
+        self._loaded = False
 
-    log.info("[token_map] Downloading NSE instrument master from Angel One...")
-    try:
-        client = SmartConnect(api_key=api_key)
-        instruments = client.instruments("NSE")  # returns list of dicts
-    except Exception as exc:
-        raise RuntimeError(f"[token_map] SmartAPI.instruments() failed: {exc}") from exc
+    # ── Load / refresh ────────────────────────────────────────────────────
 
-    if not instruments:
-        raise RuntimeError("[token_map] SmartAPI returned empty instrument list.")
+    def refresh(self, db_path: Path | None = None) -> int:
+        """Reload from instruments SQLite DB. Returns number of tokens loaded."""
+        try:
+            from instruments.storage import InstrumentStore, DB_PATH
+            store = InstrumentStore(db_path or DB_PATH)
 
-    mapping: dict[str, str] = {}
-    for row in instruments:
-        symbol = str(row.get("symbol", "")).strip().upper()
-        token  = str(row.get("token", "")).strip()
-        if symbol and token:
-            mapping[symbol] = token
+            new_map: dict[str, dict] = {}
 
-    log.info(f"[token_map] Loaded {len(mapping)} NSE instruments from SmartAPI.")
-    return mapping
+            # NSE Equity
+            for inst in store.list_by_segment("EQ"):
+                sym = (getattr(inst, "symbol", "") or "").upper()
+                if sym:
+                    new_map[sym] = {
+                        "token":    getattr(inst, "isin", sym),   # isin used as token id placeholder
+                        "exchange": getattr(inst, "exchange", "NSE"),
+                        "segment":  "EQ",
+                        "expiry":   None,
+                        "strike":   None,
+                        "opt_type": None,
+                    }
 
+            # NSE F&O — futures + CE + PE
+            for seg in ("FUT", "CE", "PE"):
+                for inst in store.list_by_segment(seg):
+                    sym = (getattr(inst, "symbol", "") or "").upper()
+                    if sym:
+                        new_map[sym] = {
+                            "token":      getattr(inst, "isin", sym),
+                            "exchange":   "NFO",
+                            "segment":    seg,
+                            "expiry":     getattr(inst, "expiry", None),
+                            "underlying": (getattr(inst, "underlying", "") or "").upper(),
+                            "strike":     getattr(inst, "strike", None),
+                            "opt_type":   getattr(inst, "option_type", None),
+                        }
 
-# ── Cache I/O ─────────────────────────────────────────────────────────────────
+            self._map    = new_map
+            self._loaded = True
+            log.info(f"[token_map] Loaded {len(new_map)} tokens (EQ + NFO).")
+            return len(new_map)
 
-def _save_cache(mapping: dict[str, str]) -> None:
-    """Write token map + timestamp to disk."""
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"timestamp": time.time(), "tokens": mapping}
-    _CACHE_FILE.write_text(json.dumps(payload, indent=2))
-    log.info(f"[token_map] Cache written: {_CACHE_FILE} ({len(mapping)} tokens)")
+        except Exception as exc:
+            log.warning(f"[token_map] refresh() failed: {exc} — using empty map.")
+            return 0
 
+    def _ensure_loaded(self) -> None:
+        if not self._loaded:
+            self.refresh()
 
-def _load_cache() -> Optional[dict[str, str]]:
-    """Load token map from disk cache. Returns None if file missing or corrupt."""
-    if not _CACHE_FILE.exists():
-        return None
-    try:
-        payload  = json.loads(_CACHE_FILE.read_text())
-        mapping  = payload.get("tokens", {})
-        saved_at = float(payload.get("timestamp", 0.0))
-        age_h    = (time.time() - saved_at) / 3600
-        log.info(f"[token_map] Cache loaded: {len(mapping)} tokens (age {age_h:.1f}h)")
-        return mapping
-    except Exception as exc:
-        log.warning(f"[token_map] Cache load failed: {exc}")
-        return None
+    # ── Lookups ───────────────────────────────────────────────────────────
 
+    def get_token(self, symbol: str) -> Optional[str]:
+        """Return token string for symbol, or None if not found."""
+        self._ensure_loaded()
+        entry = self._map.get(symbol.upper())
+        return entry["token"] if entry else None
 
-def _cache_age_secs() -> float:
-    """Return seconds since cache was written. Returns infinity if no cache."""
-    if not _CACHE_FILE.exists():
-        return float("inf")
-    try:
-        payload = json.loads(_CACHE_FILE.read_text())
-        return time.time() - float(payload.get("timestamp", 0.0))
-    except Exception:
-        return float("inf")
+    def get_exchange(self, symbol: str) -> str:
+        """Return exchange ('NSE' | 'NFO') for symbol."""
+        self._ensure_loaded()
+        entry = self._map.get(symbol.upper())
+        return entry["exchange"] if entry else "NSE"
 
+    # ── F&O expiry helpers ────────────────────────────────────────────────
 
-# ── Public API ────────────────────────────────────────────────────────────────
+    def get_all_expiries(self, underlying: str) -> list[str]:
+        """Return all distinct expiry dates for an underlying, sorted ascending."""
+        self._ensure_loaded()
+        ul = underlying.upper()
+        expiries = {
+            v["expiry"]
+            for v in self._map.values()
+            if v.get("underlying") == ul and v.get("expiry")
+        }
+        return sorted(expiries)
 
-def refresh_if_stale() -> None:
-    """Refresh token map from SmartAPI if cache is older than 24h.
+    def get_near_expiry(self, underlying: str) -> Optional[str]:
+        """Return the nearest future expiry date for an underlying.
 
-    Called by LiveExecutor.connect() to ensure token map is ready before
-    any orders are placed.
+        Falls back to computing next Thursday if DB has no F&O data yet.
+        """
+        expiries = self.get_all_expiries(underlying)
+        today    = date.today().isoformat()
+        future   = [e for e in expiries if e >= today]
+        if future:
+            return future[0]
+        # Fallback: next Thursday (NIFTY weekly expiry)
+        return _next_thursday().isoformat()
 
-    If SmartAPI is unavailable but a valid local cache exists, the cache
-    is used. If neither is available, raises RuntimeError.
-    """
-    global _token_map, _loaded_at
+    def get_contracts(
+        self,
+        underlying: str,
+        expiry: str | None = None,
+        option_type: str | None = None,
+    ) -> list[dict]:
+        """Return all F&O contracts for an underlying, optionally filtered."""
+        self._ensure_loaded()
+        ul = underlying.upper()
+        results = [
+            {"symbol": sym, **meta}
+            for sym, meta in self._map.items()
+            if meta.get("underlying") == ul
+            and (expiry is None     or meta.get("expiry")   == expiry)
+            and (option_type is None or meta.get("opt_type") == option_type.upper())
+        ]
+        return sorted(results, key=lambda r: (r.get("expiry") or "", r.get("strike") or 0))
 
-    age = _cache_age_secs()
-    if age < _TTL_SECS and _token_map:
-        log.debug(f"[token_map] Cache is fresh ({age/3600:.1f}h old). Skipping refresh.")
-        return
+    def __len__(self) -> int:
+        self._ensure_loaded()
+        return len(self._map)
 
-    # Try to download fresh data
-    try:
-        mapping = download_instrument_master()
-        _save_cache(mapping)
-        _token_map = mapping
-        _loaded_at = time.time()
-        return
-    except Exception as exc:
-        log.warning(f"[token_map] Download failed: {exc}. Falling back to disk cache.")
-
-    # Fall back to disk cache
-    cached = _load_cache()
-    if cached:
-        _token_map = cached
-        _loaded_at = time.time()
-        return
-
-    # No cache, no download — hard fail
-    raise RuntimeError(
-        "Instrument token map unavailable — cannot place orders safely. "
-        "Ensure ANGEL_API_KEY is set and network is reachable, "
-        f"or place a valid token_map.json at: {_CACHE_FILE}"
-    )
-
-
-def get_token(symbol: str) -> str:
-    """Return the Angel One instrument token for a given NSE symbol.
-
-    Args:
-        symbol: NSE symbol, e.g. 'RELIANCE', 'TCS', 'HDFCBANK'
-                .NS suffix is stripped automatically.
-
-    Returns:
-        Instrument token string (e.g. '2885').
-
-    Raises:
-        ValueError : Symbol not found in token map.
-        RuntimeError: Token map is empty (never loaded / download failed).
-    """
-    global _token_map
-
-    sym = symbol.strip().upper().replace(".NS", "").replace("-EQ", "")
-
-    # Load from disk if not yet in memory
-    if not _token_map:
-        cached = _load_cache()
-        if cached:
-            _token_map = cached
-
-    if not _token_map:
-        raise RuntimeError(
-            "Token map is empty. Call refresh_if_stale() first, "
-            "or ensure token_map.json exists at: " + str(_CACHE_FILE)
-        )
-
-    token = _token_map.get(sym)
-    if not token:
-        raise ValueError(
-            f"No instrument token for '{sym}'. "
-            "Run refresh_if_stale() to update the instrument master, "
-            "or check the symbol is listed on NSE."
-        )
-
-    return token
+    def __repr__(self) -> str:
+        return f"<TokenMap loaded={self._loaded} symbols={len(self._map)}>"
 
 
-def list_symbols() -> list[str]:
-    """Return all symbols in the loaded token map."""
-    return sorted(_token_map.keys())
+# ── Module-level singleton + convenience functions ────────────────────────
+
+_token_map = TokenMap()
 
 
-def token_count() -> int:
-    """Return number of tokens loaded in memory."""
-    return len(_token_map)
+def get_token(symbol: str) -> Optional[str]:
+    """Return token for symbol from module-level singleton."""
+    return _token_map.get_token(symbol)
+
+
+def get_exchange(symbol: str) -> str:
+    return _token_map.get_exchange(symbol)
+
+
+def get_near_expiry(symbol: str) -> Optional[str]:
+    return _token_map.get_near_expiry(symbol)
+
+
+def get_all_expiries(symbol: str) -> list[str]:
+    return _token_map.get_all_expiries(symbol)
+
+
+def refresh_from_db(db_path: Path | None = None) -> int:
+    """Reload the module-level token map from DB."""
+    return _token_map.refresh(db_path)
+
+
+# ── Helper ────────────────────────────────────────────────────────────────
+
+def _next_thursday() -> date:
+    today      = date.today()
+    days_ahead = (3 - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return today + timedelta(days=days_ahead)

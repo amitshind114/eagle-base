@@ -1,6 +1,15 @@
-"""Eagle-Base Derivatives — Options pricing and Greeks."""
+"""Derivatives and F&O package."""
 
-from .options import OptionsChain
-from .models import OptionContract
+__all__ = [
+    "BlackScholes",
+    "OptionContract",
+    "OptionChainLoader",
+    "CoveredCallStrategy",
+]
 
-__all__ = ["OptionsChain", "OptionContract"]
+from derivatives.options import (
+    BlackScholes,
+    OptionContract,
+    OptionChainLoader,
+    CoveredCallStrategy,
+)

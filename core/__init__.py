@@ -1,6 +1,13 @@
-"""Eagle-Base Core — shared config, logger, base classes."""
+"""Core utilities package."""
 
-from .config import Settings
-from .logger import get_logger
+__all__ = [
+    "get_logger",
+    "audit",
+    "AuditLog",
+    "get_conn",
+    "close_all",
+]
 
-__all__ = ["Settings", "get_logger"]
+from core.logger import get_logger
+from core.audit  import audit, AuditLog
+from core.db     import get_conn, close_all
