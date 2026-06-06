@@ -28,7 +28,11 @@ import pytest
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _make_ohlcv(n: int = 252, seed: int = 42) -> pd.DataFrame:
-    """Generate synthetic daily OHLCV (RELIANCE-like, trending up)."""
+    """Generate synthetic daily OHLCV (RELIANCE-like, trending up).
+
+    Uses numpy arrays (not pd.Series) to avoid DatetimeIndex vs RangeIndex
+    alignment NaN-ification when building the DataFrame.
+    """
     rng    = np.random.default_rng(seed)
     closes = 2500.0 * np.exp(np.cumsum(rng.normal(0.0005, 0.015, n)))
     opens  = closes * (1 + rng.normal(0, 0.003, n))
@@ -178,6 +182,13 @@ def test_black_scholes_greeks_types():
 # ── Test 6: core/db connection pool ──────────────────────────────────────────
 
 def test_db_pool_get_conn():
+    """FIX P10-WIN: close_all() must be called before TemporaryDirectory cleanup.
+
+    On Windows, SQLite connections hold a file lock. The connection pool keeps
+    the connection open after the context manager exits. If close_all() is not
+    called before tempfile.TemporaryDirectory.__exit__, Windows raises
+    PermissionError: [WinError 32] when shutil.rmtree tries to delete the file.
+    """
     from core.db import get_conn, close_all
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
@@ -188,13 +199,15 @@ def test_db_pool_get_conn():
         with get_conn(db_path) as conn:
             row = conn.execute("SELECT val FROM t WHERE id=1").fetchone()
             assert row[0] == "hello"
-    close_all()
+        close_all()   # release file lock BEFORE TemporaryDirectory.__exit__
 
 
 def test_db_pool_same_connection_reused():
-    """Two calls to get_conn with same path return the same underlying connection."""
+    """Two calls to get_conn with same path return the same underlying connection.
+
+    FIX P10-WIN: close_all() called before TemporaryDirectory exits.
+    """
     from core.db import get_conn, close_all, _pool
-    import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "pool_test.db"
         with get_conn(db_path) as c1:
@@ -202,7 +215,7 @@ def test_db_pool_same_connection_reused():
         with get_conn(db_path) as c2:
             conn_id_2 = id(c2)
         assert conn_id_1 == conn_id_2, "Pool should reuse the same connection object"
-    close_all()
+        close_all()   # release file lock BEFORE TemporaryDirectory.__exit__
 
 
 # ── Test 7: End-to-end data → backtest → 20 signals ──────────────────────────

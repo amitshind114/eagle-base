@@ -3,6 +3,10 @@
 FIX P0: Previous version called engine.run(df, signals, capital=...) which is
 the wrong signature. engine.run() takes (df, strategy), not (df, signals, capital).
 BacktestEngine(initial_capital=X) is how capital is set.
+
+FIX P10: make_df used pd.Series for column values — pandas aligns by index,
+causing all Close values to become NaN when df has a DatetimeIndex but the
+Series has a RangeIndex. Fixed by using .values (ndarray) instead.
 """
 
 from __future__ import annotations
@@ -18,8 +22,15 @@ from core.exceptions import InsufficientDataError
 
 
 def make_df(n: int = 200, seed: int = 0) -> pd.DataFrame:
-    np.random.seed(seed)
-    close = pd.Series(np.cumsum(np.random.randn(n)) + 1000)
+    """Generate synthetic OHLCV DataFrame with a proper DatetimeIndex.
+
+    FIX: close must be a numpy array (not pd.Series) so that pandas
+    does not attempt index-alignment when building the DataFrame.
+    Using a pd.Series with RangeIndex against a DatetimeIndex causes
+    all values to align as NaN.
+    """
+    rng   = np.random.default_rng(seed)
+    close = np.cumsum(rng.standard_normal(n)) + 1000.0   # ndarray, always positive near 1000
     idx   = pd.date_range("2020-01-01", periods=n, freq="B")
     return pd.DataFrame(
         {
@@ -27,7 +38,7 @@ def make_df(n: int = 200, seed: int = 0) -> pd.DataFrame:
             "High":   close * 1.01,
             "Low":    close * 0.98,
             "Close":  close,
-            "Volume": np.random.randint(100_000, 1_000_000, n).astype(float),
+            "Volume": rng.integers(100_000, 1_000_000, n).astype(float),
         },
         index=idx,
     )

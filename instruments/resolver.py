@@ -14,6 +14,13 @@ Usage:
     inst     = r.resolve("RELIANCE")         # → RELIANCE equity instrument
     expiry   = r.resolve_expiry("RELIANCE")  # → nearest date
     chain    = r.resolve_chain("RELIANCE")   # → list[Instrument] CE+PE
+
+FIX P10:
+  - count() now returns int (sum of all segments) rather than delegating to
+    InstrumentStore.count() which returns a dict. Tests use `count() > 0`.
+  - list_all(exchange=...) now filters in Python after fetching all tables,
+    because InstrumentStorage.list_all(table) takes a table name, not an
+    exchange kwarg.
 """
 
 from __future__ import annotations
@@ -91,7 +98,7 @@ class InstrumentResolver:
     def _seed_builtins(self) -> None:
         """Seed built-in instruments if the store is empty."""
         try:
-            if self._store.count() == 0:
+            if self.count() == 0:
                 self._store.insert_bulk(_BUILTIN_INSTRUMENTS)
                 log.debug(f"Seeded {len(_BUILTIN_INSTRUMENTS)} built-in instruments")
         except Exception as exc:
@@ -148,8 +155,13 @@ class InstrumentResolver:
         return None
 
     def count(self) -> int:
-        """Return total number of instruments in the store."""
-        return self._store.count()
+        """Return total number of instruments in the store as a single int.
+
+        FIX P10: InstrumentStore.count() returns a dict {EQ: N, FUT: N, ...}.
+        This method sums all values so callers can do `count() > 0`.
+        """
+        raw = self._store.count()  # dict[str, int]
+        return sum(raw.values())
 
     def search(self, query: str) -> list[Instrument]:
         """Full-text search across all instruments."""
@@ -160,8 +172,22 @@ class InstrumentResolver:
         self._store.insert_bulk([instrument])
 
     def list_all(self, exchange: str | None = None) -> list[Instrument]:
-        """List all instruments, optionally filtered by exchange."""
-        return self._store.list_all(exchange=exchange)
+        """List all instruments, optionally filtered by exchange.
+
+        FIX P10: InstrumentStorage.list_all(table) takes a table name positional
+        arg, not an 'exchange' kwarg. We iterate all four tables ourselves and
+        filter by exchange in Python.
+        """
+        from instruments.storage import _ALL_TABLES, _SEG_TABLE
+        results: list[Instrument] = []
+        for table in _ALL_TABLES:
+            rows = self._store.list_all(table)          # list[dict]
+            insts = [self._store._from_dict(r) for r in rows]
+            results.extend(insts)
+        if exchange:
+            ex_upper = exchange.upper()
+            results = [i for i in results if getattr(i, "exchange", "").upper() == ex_upper]
+        return results
 
     def resolve_yf_symbol(self, instrument: Instrument) -> str:
         """
