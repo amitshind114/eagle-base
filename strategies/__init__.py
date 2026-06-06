@@ -1,9 +1,14 @@
-"""Eagle-Base Strategies — signal generators."""
+"""Eagle-Base strategies package.
 
-from .base import BaseStrategy
-from .sma_crossover import SmaCrossover
-from .ema_crossover import EmaCrossover
-from .rsi_mean_reversion import RsiMeanReversion
-from .macd_signal import MacdSignal
+All concrete strategy classes live here. Each must:
+  1. Define a ``STRATEGY_ID`` class attribute (unique string key)
+  2. Implement ``__init__(self, symbol, capital, params)``
+  3. Implement ``on_bar(self, bar) -> dict | None``
 
-__all__ = ["BaseStrategy", "SmaCrossover", "EmaCrossover", "RsiMeanReversion", "MacdSignal"]
+Registration is handled by ``strategies/registry.py``.
+Import strategies here so the registry auto-discovers them on import.
+"""
+
+from strategies.ema_cross import EMACrossStrategy
+
+__all__ = ["EMACrossStrategy"]
