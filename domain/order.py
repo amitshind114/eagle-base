@@ -30,7 +30,7 @@ class OrderEvent(BaseModel):
     """Immutable audit record of an order state change."""
     model_config = {"frozen": True}
 
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now())
     from_status: OrderStatus
     to_status: OrderStatus
     notes: str = ""
@@ -78,8 +78,8 @@ class Order(BaseModel):
     time_in_force:    TimeInForce     = Field(default=TimeInForce.DAY)
     tag:              str             = Field(default="")
     rejection_reason: Optional[str]   = Field(default=None)
-    created_at:       datetime        = Field(default_factory=datetime.utcnow)
-    updated_at:       datetime        = Field(default_factory=datetime.utcnow)
+    created_at:       datetime        = Field(default_factory=lambda: datetime.now())
+    updated_at:       datetime        = Field(default_factory=lambda: datetime.now())
     filled_at:        Optional[datetime] = Field(default=None)
     history:          List[OrderEvent]   = Field(default_factory=list)
 
@@ -100,7 +100,8 @@ class Order(BaseModel):
 
     @model_validator(mode="after")
     def sync_pending_quantity(self) -> "Order":
-        self.pending_quantity = max(0, self.quantity - self.filled_quantity)
+        # Use object.__setattr__ to bypass validate_assignment and avoid recursion
+        object.__setattr__(self, "pending_quantity", max(0, self.quantity - self.filled_quantity))
         return self
 
     # ── Factory: risk-gated order construction ────────────────────────────
@@ -194,7 +195,7 @@ class Order(BaseModel):
         event = OrderEvent(from_status=self.status, to_status=new_status, notes=notes)
         self.history.append(event)
         self.status = new_status
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now()
         logger.debug(f"Order {self.order_id[:8]}: {event.from_status.value} → {new_status.value}")
 
     def fill(self, filled_qty: int, fill_price: float) -> None:
@@ -203,17 +204,21 @@ class Order(BaseModel):
         if fill_price <= 0:
             raise ValueError("fill price must be positive")
         total_value       = self.average_price * self.filled_quantity + fill_price * filled_qty
-        self.filled_quantity += filled_qty
-        self.average_price    = total_value / self.filled_quantity
-        self.pending_quantity = max(0, self.quantity - self.filled_quantity)
-        self.updated_at       = datetime.utcnow()
-        if self.filled_quantity >= self.quantity:
-            self.filled_at = datetime.utcnow()
+        new_filled        = self.filled_quantity + filled_qty
+        new_avg           = total_value / new_filled
+        new_pending       = max(0, self.quantity - new_filled)
+        # Use object.__setattr__ to avoid validate_assignment recursion
+        object.__setattr__(self, "filled_quantity", new_filled)
+        object.__setattr__(self, "average_price", new_avg)
+        object.__setattr__(self, "pending_quantity", new_pending)
+        object.__setattr__(self, "updated_at", datetime.now())
+        if new_filled >= self.quantity:
+            object.__setattr__(self, "filled_at", datetime.now())
             self.transition(OrderStatus.FILLED, notes=f"Filled @ {fill_price:.2f}")
         else:
             self.transition(
                 OrderStatus.PARTIALLY_FILLED,
-                notes=f"Partial {self.filled_quantity}/{self.quantity} @ {fill_price:.2f}",
+                notes=f"Partial {new_filled}/{self.quantity} @ {fill_price:.2f}",
             )
 
     def cancel(self, reason: str = "") -> None:

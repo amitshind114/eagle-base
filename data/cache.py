@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -28,6 +29,9 @@ import pandas as pd
 from core.logger import get_logger
 
 log = get_logger("data.cache")
+
+# Module-level cache directory — monkeypatchable in tests
+CACHE_DIR = Path("eagle_base/data/cache")
 
 # TTL per interval
 _TTL: dict[str, timedelta] = {
@@ -71,7 +75,6 @@ class DataCache:
         if df is None or df.empty:
             return
         if len(self._store) >= _MAX_ENTRIES:
-            # Evict oldest entry
             oldest_key = min(self._store, key=lambda k: self._store[k][1])
             del self._store[oldest_key]
 

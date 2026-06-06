@@ -50,6 +50,23 @@ class DataManager:
     Strategies and UI should ONLY use this, not DataFetcher directly.
     """
 
+    @property
+    def provider(self) -> DataFetcher:
+        """Expose the underlying data fetcher as the primary provider."""
+        return _fetcher
+
+    def health_check(self) -> dict:
+        """Return health status of all data layer components."""
+        try:
+            fetcher_status = _fetcher.health_check() if hasattr(_fetcher, "health_check") else {"status": "ok"}
+        except Exception as exc:
+            fetcher_status = {"status": "error", "reason": str(exc)}
+        return {
+            "fetcher": fetcher_status,
+            "cache": _mem_cache.stats(),
+            "status": "ok" if fetcher_status.get("status") == "ok" else "degraded",
+        }
+
     def get(
         self,
         symbol: str,
@@ -118,7 +135,6 @@ class DataManager:
 
         # ─ 5. Store in caches ──────────────────────────────────────────────
         _mem_cache.set(sym_key, interval, clean_df)
-        # Only persist daily+ to disk (intraday cache expires too fast to be useful)
         if interval in ("1d", "1wk", "1mo"):
             _disk_cache.write(sym_key, interval, clean_df)
 
@@ -149,34 +165,13 @@ class DataManager:
         interval: str = "1d",
     ) -> dict[str, pd.DataFrame]:
         """
-        Fetch multiple symbols in one batch call.
-        Returns dict {symbol: clean_df}. Skips failed symbols silently.
+        Fetch OHLCV for multiple symbols. Skips failures silently.
+        Returns dict of symbol → DataFrame for successful fetches only.
         """
-        raw_map = _fetcher.fetch_batch(symbols, period=period, interval=interval)
-        clean_map: dict[str, pd.DataFrame] = {}
-        for sym, df in raw_map.items():
-            result = _validator.validate(df, interval=interval, symbol=sym)
-            if result.clean_df is not None and not result.clean_df.empty:
-                clean_map[sym] = result.clean_df
-                _mem_cache.set(sym.upper(), interval, result.clean_df)
-        return clean_map
-
-    def search(self, query: str) -> list[dict]:
-        """Search available symbols by name or prefix."""
-        return _fetcher.search_symbols(query)
-
-    def cache_stats(self) -> dict:
-        """Return memory and disk cache statistics."""
-        return {
-            "memory": _mem_cache.stats(),
-            "disk": {
-                "cached_entries": len(_disk_cache.list_cached()),
-                "details": _disk_cache.cache_info(),
-            },
-        }
-
-    def invalidate(self, symbol: str, interval: Optional[str] = None) -> None:
-        """Force invalidate cache for a symbol."""
-        _mem_cache.invalidate(symbol, interval)
-        _disk_cache.invalidate(symbol, interval)
-        log.info(f"Cache invalidated: {symbol}/{interval or 'all'}")
+        results: dict[str, pd.DataFrame] = {}
+        for sym in symbols:
+            try:
+                results[sym] = self.get(sym, period=period, interval=interval)
+            except Exception as exc:
+                log.warning(f"batch_get: skipping {sym} — {exc}")
+        return results

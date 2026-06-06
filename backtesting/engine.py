@@ -51,6 +51,21 @@ def _nse_charges(turnover: float, side: str) -> float:
     return brokerage + stt + exchange + sebi + stamp + gst
 
 
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize DataFrame columns to Title Case (Open/High/Low/Close/Volume)."""
+    col_map = {c: c.strip().capitalize() for c in df.columns}
+    # Handle common variants like 'open', 'OPEN', 'Adj Close'
+    rename = {}
+    for orig, cap in col_map.items():
+        if orig.lower() == "open":   rename[orig] = "Open"
+        elif orig.lower() == "high":  rename[orig] = "High"
+        elif orig.lower() == "low":   rename[orig] = "Low"
+        elif orig.lower() == "close": rename[orig] = "Close"
+        elif orig.lower() in ("volume", "vol"): rename[orig] = "Volume"
+        elif orig.lower() in ("adj close", "adj_close"): rename[orig] = "Adj Close"
+    return df.rename(columns=rename)
+
+
 class BacktestEngine:
     """Event-driven backtesting engine with accurate NSE cost simulation."""
 
@@ -79,6 +94,12 @@ class BacktestEngine:
             raise InsufficientDataError("Need at least 10 bars to backtest")
 
         df = df.copy()
+        # Normalize column names so strategies always see Open/High/Low/Close/Volume
+        df = _normalize_columns(df)
+
+        if "Close" not in df.columns:
+            raise BacktestError("DataFrame must have a 'Close' column after normalization")
+
         signals: pd.Series = strategy.generate_signals(df)
 
         if len(signals) != len(df):
@@ -155,7 +176,6 @@ class BacktestEngine:
             cost_basis   = avg_cost * position
             pnl_pct      = net_pnl / cost_basis * 100 if cost_basis > 0 else 0.0
             cash        += turnover - charges
-            # Correct the final equity entry to reflect closed cash (no mark-to-market)
             equity[-1]   = cash
 
             trades.append(Trade(
@@ -171,14 +191,19 @@ class BacktestEngine:
                 exit_reason  = "END_OF_DATA",
             ))
 
-        equity_series = pd.Series(equity, index=df.index)
+        # ─ Build equity series — initialise to capital if no trades ───────
+        if equity:
+            equity_series = pd.Series(equity, index=df.index, dtype=float)
+        else:
+            equity_series = pd.Series(capital, index=df.index, dtype=float)
+
         bh_series     = capital * (1 + df["Close"].pct_change().fillna(0)).cumprod()
-        dd_series     = (equity_series / equity_series.cummax()) - 1   # negative fractions
+        dd_series     = (equity_series / equity_series.cummax()) - 1
 
         final_cap    = float(equity_series.iloc[-1])
         total_return = (final_cap - capital) / capital * 100
         bh_return    = (float(bh_series.iloc[-1]) - capital) / capital * 100
-        max_dd       = float(dd_series.min() * 100)   # negative (e.g. -15.3)
+        max_dd       = float(dd_series.min() * 100)
 
         strat_rets = equity_series.pct_change().fillna(0)
         std        = float(strat_rets.std())
@@ -193,13 +218,12 @@ class BacktestEngine:
         avg_loss   = sum(losses) / len(losses) / capital * 100 if losses else 0.0
         pf_num     = sum(wins)
         pf_den     = abs(sum(losses))
-        # FIX P1: all-win strategy must NOT return 0.0
         if pf_den > 0:
             profit_factor = round(pf_num / pf_den, 4)
         elif pf_num > 0:
-            profit_factor = 999.0   # all wins, no losses
+            profit_factor = 999.0
         else:
-            profit_factor = 0.0     # no trades or all-loss
+            profit_factor = 0.0
 
         log.info(
             f"{self.symbol} | Return={total_return:.1f}% Sharpe={sharpe:.2f} "
@@ -217,7 +241,7 @@ class BacktestEngine:
             total_return_pct    = round(total_return, 2),
             buy_hold_return_pct = round(bh_return, 2),
             sharpe_ratio        = round(sharpe, 3),
-            max_drawdown_pct    = round(max_dd, 2),   # negative
+            max_drawdown_pct    = round(max_dd, 2),
             win_rate_pct        = round(win_rate, 2),
             total_trades        = n_trades,
             profit_factor       = profit_factor,

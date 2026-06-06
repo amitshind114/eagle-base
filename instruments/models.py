@@ -32,19 +32,24 @@ class Instrument(BaseModel):
 
     @property
     def is_equity(self) -> bool:
-        return self.segment == "EQ"
+        return self.segment.upper() in ("EQ", "EQUITY")
 
     @property
     def is_future(self) -> bool:
-        return self.segment == "FUT"
+        return self.segment.upper() in ("FUT", "FUTURES")
 
     @property
     def is_option(self) -> bool:
-        return self.segment in ("CE", "PE")
+        return self.segment.upper() in ("CE", "PE", "OPT", "OPTIONS")
 
     @property
     def is_index(self) -> bool:
-        return self.segment == "IDX"
+        return self.segment.upper() in ("IDX", "INDEX")
+
+    @property
+    def is_derivative(self) -> bool:
+        """True for futures and options."""
+        return self.segment.upper() in ("FUT", "CE", "PE", "OPT", "FUTURES", "OPTIONS")
 
     def display(self) -> str:
         """Human-readable label for UI dropdowns."""
