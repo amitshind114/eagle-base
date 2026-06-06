@@ -6,11 +6,11 @@ backtesting/result.py is an alias that re-exports from this module.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ── Trade ────────────────────────────────────────────────────────────────
@@ -65,8 +65,8 @@ class BacktestResult(BaseModel):
     symbol: str = ""
     strategy_name: str = ""
 
-    # Trade log
-    trades: list = field(default_factory=list)  # list[Trade]
+    # Trade log — use Pydantic Field for mutable default (NOT dataclasses.field)
+    trades: list = Field(default_factory=list)  # list[Trade]
 
     # Curves
     equity_curve: pd.Series = None          # type: ignore[assignment]
