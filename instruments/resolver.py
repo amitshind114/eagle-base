@@ -28,46 +28,54 @@ from .storage import InstrumentStore
 log = get_logger("instruments.resolver")
 
 # Built-in seeds — always available even with empty SQLite store.
-# Note: symbols match test expectations exactly.
+# token values match NSE instrument master (used by broker APIs).
 _BUILTIN_INSTRUMENTS: list[Instrument] = [
     Instrument(
         symbol="NIFTY", name="NIFTY 50", exchange="NSE", segment="IDX",
         lot_size=75, tick_size=0.05,
+        token="26000",
         underlying="NIFTY", yf_symbol="^NSEI",
     ),
     Instrument(
         symbol="NIFTY50", name="NIFTY 50", exchange="NSE", segment="IDX",
         lot_size=75, tick_size=0.05,
+        token="26000",
         underlying="NIFTY50", yf_symbol="^NSEI",
     ),
     Instrument(
         symbol="BANKNIFTY", name="NIFTY Bank", exchange="NSE", segment="IDX",
         lot_size=15, tick_size=0.05,
+        token="26009",
         underlying="BANKNIFTY", yf_symbol="^NSEBANK",
     ),
     Instrument(
         symbol="SENSEX", name="BSE Sensex", exchange="BSE", segment="IDX",
         lot_size=10, tick_size=0.01,
+        token="1",
         underlying="SENSEX", yf_symbol="^BSESN",
     ),
     Instrument(
         symbol="RELIANCE", name="Reliance Industries", exchange="NSE", segment="EQ",
         lot_size=1, tick_size=0.05,
+        token="2885",
         underlying="RELIANCE", yf_symbol="RELIANCE.NS",
     ),
     Instrument(
         symbol="TATASTEEL", name="Tata Steel", exchange="NSE", segment="EQ",
         lot_size=1, tick_size=0.05,
+        token="3499",
         underlying="TATASTEEL", yf_symbol="TATASTEEL.NS",
     ),
     Instrument(
         symbol="TCS", name="Tata Consultancy Services", exchange="NSE", segment="EQ",
         lot_size=1, tick_size=0.05,
+        token="11536",
         underlying="TCS", yf_symbol="TCS.NS",
     ),
     Instrument(
         symbol="HDFCBANK", name="HDFC Bank", exchange="NSE", segment="EQ",
         lot_size=1, tick_size=0.05,
+        token="1333",
         underlying="HDFCBANK", yf_symbol="HDFCBANK.NS",
     ),
 ]

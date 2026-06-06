@@ -1,9 +1,18 @@
 """Core backtesting engine — runs a strategy on historical OHLCV data.
 
+Phase-02 accuracy fixes applied:
+  - Look-ahead bias   : signals.shift(1) after generate_signals()
+  - Sharpe annualise  : interval-aware PERIODS dict (not hardcoded 252)
+  - Buy-hold curve    : capital * close/close[0]  (not pct_change cumprod)
+  - avg_win/loss pct  : % of trade cost, not % of total capital
+  - STT rate          : product_type param — MIS=0.025%, CNC=0.1% both sides
+  - Forced-close fix  : equity[-1] set correctly after last-bar close
+  - Min-bars guard    : 10 bars (strategy warmup is strategy's responsibility)
+
 Accurate NSE cost model:
     - Slippage  : configurable fill-price offset (default 0.05%)
-    - Brokerage : flat ₹20 per executed order (Zerodha MIS default)
-    - STT       : 0.025% on sell-side turnover
+    - Brokerage : flat Rs20 per executed order (Zerodha MIS default)
+    - STT       : 0.025% sell-side (MIS) or 0.1% both sides (CNC delivery)
     - Exchange  : 0.00335% NSE transaction charge
     - SEBI      : 0.0001% on turnover
     - Stamp     : 0.003% on buy-side turnover
@@ -31,23 +40,51 @@ if TYPE_CHECKING:
 
 log = get_logger("backtesting.engine")
 
-# ── NSE charge constants ──────────────────────────────────────────────────
-_BROKERAGE_FLAT  = 20.0        # ₹20 per order (intraday)
-_STT_SELL        = 0.00025     # 0.025% on sell turnover
-_EXCHANGE_CHARGE = 0.0000335   # NSE txn charge
-_SEBI_CHARGE     = 0.000001    # ₹10/crore
-_STAMP_BUY       = 0.00003     # 0.003% on buy turnover
-_GST             = 0.18        # 18% on brokerage + exchange
+# ── Interval → annualisation periods ────────────────────────────────────
+# Used for Sharpe ratio: sqrt(PERIODS[interval])
+PERIODS: dict[str, int] = {
+    "1m":  252 * 375,
+    "3m":  252 * 125,
+    "5m":  252 * 75,
+    "15m": 252 * 25,
+    "30m": 252 * 12,
+    "1h":  252 * 6,
+    "1d":  252,
+    "1wk": 52,
+    "1mo": 12,
+}
+
+# ── NSE charge constants ─────────────────────────────────────────────────
+_BROKERAGE_FLAT   = 20.0        # Rs20 per order (intraday MIS)
+_STT_MIS_SELL     = 0.00025     # 0.025% on sell turnover (intraday MIS)
+_STT_CNC_SIDE     = 0.001       # 0.1%  on each side    (delivery CNC)
+_EXCHANGE_CHARGE  = 0.0000335   # NSE transaction charge
+_SEBI_CHARGE      = 0.000001    # Rs10/crore
+_STAMP_BUY        = 0.00003     # 0.003% on buy turnover
+_GST              = 0.18        # 18% on brokerage + exchange
 
 
-def _nse_charges(turnover: float, side: str) -> float:
-    """Total NSE charges in INR for one leg of a trade."""
+def _nse_charges(turnover: float, side: str, product_type: str = "MIS") -> float:
+    """Total NSE charges in INR for one leg of a trade.
+
+    Args:
+        turnover     : fill_price * quantity
+        side         : 'BUY' or 'SELL'
+        product_type : 'MIS' (intraday) or 'CNC' (delivery)
+    """
     brokerage = _BROKERAGE_FLAT
-    stt       = turnover * _STT_SELL  if side == "SELL" else 0.0
-    exchange  = turnover * _EXCHANGE_CHARGE
-    sebi      = turnover * _SEBI_CHARGE
-    stamp     = turnover * _STAMP_BUY if side == "BUY"  else 0.0
-    gst       = (brokerage + exchange) * _GST
+
+    if product_type == "CNC":
+        # Delivery: STT 0.1% on BOTH buy and sell sides
+        stt = turnover * _STT_CNC_SIDE
+    else:
+        # Intraday MIS: STT 0.025% on sell side only
+        stt = turnover * _STT_MIS_SELL if side == "SELL" else 0.0
+
+    exchange = turnover * _EXCHANGE_CHARGE
+    sebi     = turnover * _SEBI_CHARGE
+    stamp    = turnover * _STAMP_BUY if side == "BUY" else 0.0
+    gst      = (brokerage + exchange) * _GST
     return brokerage + stt + exchange + sebi + stamp + gst
 
 
@@ -56,11 +93,11 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename = {}
     for orig in df.columns:
         low = orig.strip().lower()
-        if low == "open":                rename[orig] = "Open"
-        elif low == "high":              rename[orig] = "High"
-        elif low == "low":               rename[orig] = "Low"
-        elif low == "close":             rename[orig] = "Close"
-        elif low in ("volume", "vol"):   rename[orig] = "Volume"
+        if low == "open":                       rename[orig] = "Open"
+        elif low == "high":                     rename[orig] = "High"
+        elif low == "low":                      rename[orig] = "Low"
+        elif low == "close":                    rename[orig] = "Close"
+        elif low in ("volume", "vol"):          rename[orig] = "Volume"
         elif low in ("adj close", "adj_close"): rename[orig] = "Adj Close"
     return df.rename(columns=rename)
 
@@ -68,21 +105,30 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 class BacktestEngine:
     """Event-driven backtesting engine with accurate NSE cost simulation."""
 
+    # Minimum bars required AFTER NaN drop.
+    # 10 is the absolute floor — strategy warmup (e.g. SMA 50) is the
+    # strategy's responsibility, not the engine's.
+    MIN_BARS = 10
+
     def __init__(
         self,
         symbol: str = "",
         initial_capital: float = 100_000.0,
         commission_pct: float = 0.0,
         slippage_pct: float = 0.0005,
+        interval: str = "1d",
+        product_type: str = "MIS",
     ) -> None:
         self.symbol          = symbol
         self.initial_capital = initial_capital
         self.slippage_pct    = slippage_pct
+        self.interval        = interval
+        self.product_type    = product_type.upper()
 
     def run(self, df: pd.DataFrame, strategy: "BaseStrategy") -> BacktestResult:
         """Run strategy on OHLCV df and return a fully populated BacktestResult."""
-        if df is None or df.empty or len(df) < 10:
-            raise InsufficientDataError("Need at least 10 bars to backtest")
+        if df is None or df.empty or len(df) < self.MIN_BARS:
+            raise InsufficientDataError(f"Need at least {self.MIN_BARS} bars to backtest")
 
         df = df.copy()
         df = _normalize_columns(df)
@@ -92,13 +138,18 @@ class BacktestEngine:
 
         # Drop rows where Close is NaN so equity math never sees NaN inputs
         df = df.dropna(subset=["Close"])
-        if len(df) < 10:
-            raise InsufficientDataError("Too few valid Close bars after NaN drop")
+        if len(df) < self.MIN_BARS:
+            raise InsufficientDataError(
+                f"Too few valid Close bars after NaN drop (have {len(df)}, need {self.MIN_BARS})"
+            )
 
+        # ── Phase-02 FIX: look-ahead bias ─────────────────────────────────
+        # generate_signals() sees bar N data.  Shifting by 1 means the signal
+        # is ACTED on at bar N+1 — the earliest bar the signal can be known.
         signals: pd.Series = strategy.generate_signals(df)
-
         if len(signals) != len(df):
             raise BacktestError("signals length must match df length")
+        signals = signals.shift(1).fillna(0).astype(int)   # ← look-ahead fix
 
         strategy_name = getattr(strategy, "name", type(strategy).__name__)
 
@@ -111,18 +162,31 @@ class BacktestEngine:
         equity: list[float] = []
         trades: list[Trade] = []
         total_charges = 0.0
+        intraday = self.interval != "1d"
 
-        for i, (ts, row) in enumerate(df.iterrows()):
-            sig   = int(signals.iloc[i])
-            close = float(row["Close"])
+        close_arr  = df["Close"].to_numpy(dtype=float)
+        open_arr   = df["Open"].to_numpy(dtype=float) if "Open" in df.columns else close_arr
+        sig_arr    = signals.to_numpy(dtype=int)
+        idx_arr    = df.index
+
+        for i in range(len(df)):
+            sig   = sig_arr[i]
+            close = close_arr[i]
+            ts    = idx_arr[i]
+
+            # ── Phase-02 FIX: intraday fill at next-bar open ───────────────
+            if intraday and i + 1 < len(df):
+                fill_open = open_arr[i + 1]
+            else:
+                fill_open = close
 
             # ─ Entry: BUY signal and flat ─────────────────────────────────
             if sig == 1 and position == 0 and close > 0:
-                fill_price = close * (1 + self.slippage_pct)
+                fill_price = fill_open * (1 + self.slippage_pct)
                 qty        = int(cash * 0.95 / fill_price)
                 if qty > 0:
                     turnover          = fill_price * qty
-                    charges           = _nse_charges(turnover, "BUY")
+                    charges           = _nse_charges(turnover, "BUY", self.product_type)
                     cash             -= (turnover + charges)
                     avg_cost          = fill_price
                     entry_price_fill  = fill_price
@@ -132,13 +196,14 @@ class BacktestEngine:
 
             # ─ Exit: SELL signal while in position ────────────────────────
             elif sig == -1 and position > 0 and close > 0:
-                fill_price  = close * (1 - self.slippage_pct)
+                fill_price  = fill_open * (1 - self.slippage_pct)
                 turnover    = fill_price * position
-                charges     = _nse_charges(turnover, "SELL")
+                charges     = _nse_charges(turnover, "SELL", self.product_type)
+                trade_cost  = avg_cost * position
                 gross_pnl   = (fill_price - avg_cost) * position
                 net_pnl     = gross_pnl - charges
-                cost_basis  = avg_cost * position
-                pnl_pct     = net_pnl / cost_basis * 100 if cost_basis > 0 else 0.0
+                # ── Phase-02 FIX: avg_win/loss as % of TRADE COST not capital
+                pnl_pct     = net_pnl / trade_cost * 100 if trade_cost > 0 else 0.0
                 cash       += turnover - charges
                 total_charges += charges
 
@@ -161,16 +226,19 @@ class BacktestEngine:
             mark_to_market = position * close
             equity.append(cash + mark_to_market)
 
-        # ─ Force-close open position at last bar ──────────────────────────
+        # ── Phase-02 FIX: forced-close — no double-count ──────────────────
         if position > 0:
             last_close   = float(df["Close"].iloc[-1])
             fill_price   = last_close * (1 - self.slippage_pct)
             turnover     = fill_price * position
-            charges      = _nse_charges(turnover, "SELL")
-            net_pnl      = (fill_price - avg_cost) * position - charges
-            cost_basis   = avg_cost * position
-            pnl_pct      = net_pnl / cost_basis * 100 if cost_basis > 0 else 0.0
+            charges      = _nse_charges(turnover, "SELL", self.product_type)
+            trade_cost   = avg_cost * position
+            gross_pnl    = (fill_price - avg_cost) * position
+            net_pnl      = gross_pnl - charges
+            pnl_pct      = net_pnl / trade_cost * 100 if trade_cost > 0 else 0.0
             cash        += turnover - charges
+            total_charges += charges
+            # Fix: position is now closed so equity = cash only (no MTM)
             equity[-1]   = cash
 
             trades.append(Trade(
@@ -186,21 +254,21 @@ class BacktestEngine:
                 exit_reason  = "END_OF_DATA",
             ))
 
-        # ─ Build equity series ─────────────────────────────────────────────
-        # CRITICAL: when no trades fired (e.g. signals all 0), equity list will
-        # be full of cash=capital values. We must never produce a NaN series.
+        # ── Build equity series ───────────────────────────────────────────
         if equity:
             equity_series = pd.Series(equity, index=df.index, dtype=float)
         else:
-            # Absolute fallback — stays at initial capital
             equity_series = pd.Series(
                 [float(capital)] * len(df), index=df.index, dtype=float
             )
 
-        # Ensure no NaN bleeds in from edge cases
-        equity_series = equity_series.fillna(method="ffill").fillna(float(capital))
+        equity_series = equity_series.ffill().fillna(float(capital))
 
-        bh_series  = capital * (1 + df["Close"].pct_change().fillna(0)).cumprod()
+        # ── Phase-02 FIX: correct buy-hold curve ─────────────────────────
+        # Old: capital * (1 + pct_change().fillna(0)).cumprod()  — off by one bar
+        # New: capital * (close / close[0])  — mathematically exact
+        bh_series  = capital * (df["Close"] / float(df["Close"].iloc[0]))
+
         dd_series  = (equity_series / equity_series.cummax()) - 1
 
         final_cap    = float(equity_series.iloc[-1])
@@ -208,25 +276,41 @@ class BacktestEngine:
         bh_return    = (float(bh_series.iloc[-1]) - capital) / capital * 100
         max_dd       = float(dd_series.min() * 100)
 
-        # Guard: if no trades, equity is flat → max_dd = 0, final_cap = capital
         if not trades:
-            max_dd    = 0.0
-            final_cap = float(capital)
+            max_dd       = 0.0
+            final_cap    = float(capital)
             total_return = 0.0
 
-        strat_rets = equity_series.pct_change().fillna(0)
-        std        = float(strat_rets.std())
-        sharpe     = float(strat_rets.mean() / std * np.sqrt(252)) if std > 0 else 0.0
+        # ── Phase-02 FIX: interval-aware Sharpe annualisation ─────────────
+        ann_periods = PERIODS.get(self.interval, 252)
+        strat_rets  = equity_series.pct_change().fillna(0)
+        std         = float(strat_rets.std())
+        sharpe      = float(strat_rets.mean() / std * np.sqrt(ann_periods)) if std > 0 else 0.0
 
         trades_pnl = [t.pnl for t in trades]
         wins       = [p for p in trades_pnl if p > 0]
         losses     = [p for p in trades_pnl if p <= 0]
         n_trades   = len(trades_pnl)
         win_rate   = len(wins) / n_trades * 100 if n_trades else 0.0
-        avg_win    = sum(wins) / len(wins) / capital * 100 if wins else 0.0
-        avg_loss   = sum(losses) / len(losses) / capital * 100 if losses else 0.0
-        pf_num     = sum(wins)
-        pf_den     = abs(sum(losses))
+
+        # Phase-02 FIX: avg win/loss as % of trade cost, not % of total capital
+        win_trades  = [t for t in trades if t.pnl > 0]
+        loss_trades = [t for t in trades if t.pnl <= 0]
+        if win_trades:
+            avg_win = sum(
+                t.pnl / (t.entry_price * t.quantity) * 100 for t in win_trades
+            ) / len(win_trades)
+        else:
+            avg_win = 0.0
+        if loss_trades:
+            avg_loss = sum(
+                t.pnl / (t.entry_price * t.quantity) * 100 for t in loss_trades
+            ) / len(loss_trades)
+        else:
+            avg_loss = 0.0
+
+        pf_num = sum(wins)
+        pf_den = abs(sum(losses))
         if pf_den > 0:
             profit_factor = round(pf_num / pf_den, 4)
         elif pf_num > 0:
@@ -237,7 +321,7 @@ class BacktestEngine:
         log.info(
             f"{self.symbol} | Return={total_return:.1f}% Sharpe={sharpe:.2f} "
             f"MaxDD={max_dd:.1f}% WR={win_rate:.1f}% Trades={n_trades} "
-            f"Charges=\u20b9{total_charges:,.0f}"
+            f"Charges=Rs{total_charges:,.0f}"
         )
 
         return BacktestResult(

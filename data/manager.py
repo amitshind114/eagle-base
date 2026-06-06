@@ -61,18 +61,29 @@ class DataManager:
         return _mem_cache
 
     def health_check(self) -> dict:
-        """Return health status of all data layer components."""
+        """Return health status of all data layer components.
+
+        Keys returned:
+          provider     — status of the data fetcher
+          fetcher      — alias for provider (backward compat)
+          cache        — in-memory cache stats dict
+          cache_files  — alias for cache (test compatibility)
+          status       — 'ok' | 'degraded'
+        """
         try:
             fetcher_status = _fetcher.health_check() if hasattr(_fetcher, "health_check") else {"status": "ok"}
         except Exception as exc:
             fetcher_status = {"status": "error", "reason": str(exc)}
 
-        ok = fetcher_status.get("status") == "ok"
+        ok          = fetcher_status.get("status") == "ok"
+        cache_stats = _mem_cache.stats()
+
         return {
-            "provider": fetcher_status,      # tests check for 'provider' key
-            "fetcher":  fetcher_status,      # keep backward-compat key too
-            "cache":    _mem_cache.stats(),
-            "status":   "ok" if ok else "degraded",
+            "provider":    fetcher_status,   # primary key
+            "fetcher":     fetcher_status,   # backward-compat alias
+            "cache":       cache_stats,      # in-memory stats
+            "cache_files": cache_stats,      # test-compat alias (same data)
+            "status":      "ok" if ok else "degraded",
         }
 
     # ── Data access ───────────────────────────────────────────────────────

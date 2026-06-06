@@ -9,12 +9,31 @@ from pydantic import BaseModel
 
 
 class Instrument(BaseModel):
-    """Single tradable instrument — equity, future, option or index."""
+    """Single tradable instrument — equity, future, option or index.
+
+    Fields:
+        symbol        : canonical key  e.g. RELIANCE-EQ or RELIANCE
+        name          : full company name
+        exchange      : NSE | BSE
+        segment       : EQ | FUT | CE | PE | IDX
+        token         : exchange instrument token (e.g. NSE token '2885' for RELIANCE)
+        isin          : ISIN code
+        lot_size      : contract lot size (1 for equities)
+        tick_size     : minimum price movement
+        sector        : sector classification
+        industry      : industry classification
+        underlying    : parent symbol for derivatives (RELIANCE for RELIANCE FUT)
+        expiry        : expiry date for F&O contracts
+        strike        : strike price for options
+        option_type   : CE | PE | None
+        yf_symbol     : Yahoo Finance ticker (RELIANCE.NS)
+    """
 
     symbol: str                          # canonical key  e.g. RELIANCE-EQ
     name: str                            # full company name
     exchange: str = "NSE"               # NSE | BSE
     segment: str = "EQ"                  # EQ | FUT | CE | PE | IDX
+    token: str = ""                      # exchange instrument token
     isin: str = ""
     lot_size: int = 1
     tick_size: float = 0.05
