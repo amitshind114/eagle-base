@@ -4,20 +4,18 @@ Single entry point for all data requests in the system.
 Strategies, backtesting, UI — all use DataManager, never DataFetcher directly.
 
 Layer order:
-  1. In-memory cache (DataCache)       → fastest, TTL-aware
+  1. In-memory cache (DataCache)         → fastest, TTL-aware
   2. Parquet disk cache (ParquetStorage) → fast, survives restarts
-  3. yfinance via DataFetcher          → network, always fresh
+  3. yfinance via DataFetcher            → network, always fresh
 
 Every dataset is:
   a. Validated (DataValidator) before being returned
   b. Cached in memory and on disk after fetch
-  c. Auto-resolved via SymbolResolver (any input → yfinance ticker)
 
 Usage:
     from data.manager import DataManager
     dm = DataManager()
     df    = dm.get("RELIANCE", period="1y", interval="1d")
-    df5m  = dm.get("TCS", period="5d", interval="5m")
     price = dm.price("NIFTY")
     info  = dm.info("HDFCBANK")
 """
@@ -38,9 +36,9 @@ from .storage import ParquetStorage
 log = get_logger("data.manager")
 
 # Module-level singletons — shared across all DataManager instances
-_fetcher   = DataFetcher()
-_validator = DataValidator()
-_mem_cache = DataCache()
+_fetcher    = DataFetcher()
+_validator  = DataValidator()
+_mem_cache  = DataCache()
 _disk_cache = ParquetStorage()
 
 
@@ -50,10 +48,17 @@ class DataManager:
     Strategies and UI should ONLY use this, not DataFetcher directly.
     """
 
+    # ── Public properties (test-required) ─────────────────────────────────
+
     @property
     def provider(self) -> DataFetcher:
         """Expose the underlying data fetcher as the primary provider."""
         return _fetcher
+
+    @property
+    def cache(self) -> DataCache:
+        """Expose the in-memory cache."""
+        return _mem_cache
 
     def health_check(self) -> dict:
         """Return health status of all data layer components."""
@@ -61,11 +66,16 @@ class DataManager:
             fetcher_status = _fetcher.health_check() if hasattr(_fetcher, "health_check") else {"status": "ok"}
         except Exception as exc:
             fetcher_status = {"status": "error", "reason": str(exc)}
+
+        ok = fetcher_status.get("status") == "ok"
         return {
-            "fetcher": fetcher_status,
-            "cache": _mem_cache.stats(),
-            "status": "ok" if fetcher_status.get("status") == "ok" else "degraded",
+            "provider": fetcher_status,      # tests check for 'provider' key
+            "fetcher":  fetcher_status,      # keep backward-compat key too
+            "cache":    _mem_cache.stats(),
+            "status":   "ok" if ok else "degraded",
         }
+
+    # ── Data access ───────────────────────────────────────────────────────
 
     def get(
         self,
@@ -112,7 +122,7 @@ class DataManager:
                 _mem_cache.set(sym_key, interval, disk_df)
                 return disk_df
 
-        # ─ 3. Fetch from yfinance ───────────────────────────────────────
+        # ─ 3. Fetch from yfinance ──────────────────────────────────────────
         log.info(f"Fetching fresh: {sym_key}/{interval} period={period}")
         raw_df = _fetcher.fetch(symbol, period=period, interval=interval, min_bars=2)
 
@@ -152,10 +162,7 @@ class DataManager:
             return 0.0
 
     def info(self, symbol: str) -> dict:
-        """
-        Return instrument metadata: name, sector, price, market cap.
-        Never raises. Returns partial dict on failure.
-        """
+        """Return instrument metadata. Never raises."""
         return _fetcher.fetch_info(symbol)
 
     def batch_get(
@@ -164,10 +171,7 @@ class DataManager:
         period: str = "1y",
         interval: str = "1d",
     ) -> dict[str, pd.DataFrame]:
-        """
-        Fetch OHLCV for multiple symbols. Skips failures silently.
-        Returns dict of symbol → DataFrame for successful fetches only.
-        """
+        """Fetch OHLCV for multiple symbols. Skips failures silently."""
         results: dict[str, pd.DataFrame] = {}
         for sym in symbols:
             try:

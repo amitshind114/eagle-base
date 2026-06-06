@@ -129,6 +129,20 @@ class InstrumentStore:
             ).fetchall()
         return [self._from_row(r) for r in rows]
 
+    def list_all(self, exchange: Optional[str] = None) -> List[Instrument]:
+        """Return all instruments, optionally filtered by exchange."""
+        with self._conn() as conn:
+            if exchange:
+                rows = conn.execute(
+                    "SELECT * FROM instruments WHERE UPPER(exchange)=? ORDER BY symbol",
+                    (exchange.upper(),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM instruments ORDER BY symbol"
+                ).fetchall()
+        return [self._from_row(r) for r in rows]
+
     def list_underlyings(self) -> List[str]:
         """All unique underlying symbols (stocks with F&O)."""
         with self._conn() as conn:
@@ -137,7 +151,13 @@ class InstrumentStore:
             ).fetchall()
         return [r[0] for r in rows]
 
-    def count(self) -> dict[str, int]:
+    def count(self) -> int:
+        """Total count of instruments in the store."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()
+        return int(row[0])
+
+    def count_by_segment(self) -> dict[str, int]:
         """Count of instruments per segment."""
         with self._conn() as conn:
             rows = conn.execute(

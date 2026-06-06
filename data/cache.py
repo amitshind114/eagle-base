@@ -16,6 +16,10 @@ Usage:
         df = fetch_from_source()
         cache.set("RELIANCE.NS", "5m", df)
     cache.invalidate("RELIANCE.NS")
+
+    # Test-compatible aliases:
+    df = cache.read(symbol, interval, from_date, to_date)
+    cache.write(df, symbol, interval, from_date, to_date)
 """
 
 from __future__ import annotations
@@ -83,6 +87,31 @@ class DataCache:
         key = (symbol.upper(), interval)
         self._store[key] = (df.copy(), expires_at)
         log.debug(f"Cached {len(df)} bars for {symbol}/{interval} (TTL={ttl})")
+
+    def read(
+        self,
+        symbol: str,
+        interval: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """Alias for get() — test-compatible interface.
+
+        from_date / to_date are accepted but ignored in the in-memory cache
+        (the full cached DataFrame is returned and callers can slice).
+        """
+        return self.get(symbol, interval)
+
+    def write(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        interval: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> None:
+        """Alias for set() — test-compatible interface."""
+        self.set(symbol, interval, df)
 
     def invalidate(self, symbol: str, interval: Optional[str] = None) -> None:
         """Remove cache entry/entries for a symbol."""

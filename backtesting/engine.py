@@ -53,16 +53,15 @@ def _nse_charges(turnover: float, side: str) -> float:
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize DataFrame columns to Title Case (Open/High/Low/Close/Volume)."""
-    col_map = {c: c.strip().capitalize() for c in df.columns}
-    # Handle common variants like 'open', 'OPEN', 'Adj Close'
     rename = {}
-    for orig, cap in col_map.items():
-        if orig.lower() == "open":   rename[orig] = "Open"
-        elif orig.lower() == "high":  rename[orig] = "High"
-        elif orig.lower() == "low":   rename[orig] = "Low"
-        elif orig.lower() == "close": rename[orig] = "Close"
-        elif orig.lower() in ("volume", "vol"): rename[orig] = "Volume"
-        elif orig.lower() in ("adj close", "adj_close"): rename[orig] = "Adj Close"
+    for orig in df.columns:
+        low = orig.strip().lower()
+        if low == "open":                rename[orig] = "Open"
+        elif low == "high":              rename[orig] = "High"
+        elif low == "low":               rename[orig] = "Low"
+        elif low == "close":             rename[orig] = "Close"
+        elif low in ("volume", "vol"):   rename[orig] = "Volume"
+        elif low in ("adj close", "adj_close"): rename[orig] = "Adj Close"
     return df.rename(columns=rename)
 
 
@@ -73,32 +72,28 @@ class BacktestEngine:
         self,
         symbol: str = "",
         initial_capital: float = 100_000.0,
-        commission_pct: float = 0.0,      # legacy param — kept for API compat, ignored
-        slippage_pct: float = 0.0005,     # 0.05% default fill slippage
+        commission_pct: float = 0.0,
+        slippage_pct: float = 0.0005,
     ) -> None:
         self.symbol          = symbol
         self.initial_capital = initial_capital
         self.slippage_pct    = slippage_pct
 
     def run(self, df: pd.DataFrame, strategy: "BaseStrategy") -> BacktestResult:
-        """Run strategy on OHLCV df and return a fully populated BacktestResult.
-
-        Args:
-            df       : DataFrame with columns Open/High/Low/Close/Volume and DatetimeIndex.
-            strategy : A BaseStrategy instance. engine calls strategy.generate_signals(df).
-
-        Returns:
-            BacktestResult with equity curve, trade log, and all scalar metrics.
-        """
+        """Run strategy on OHLCV df and return a fully populated BacktestResult."""
         if df is None or df.empty or len(df) < 10:
             raise InsufficientDataError("Need at least 10 bars to backtest")
 
         df = df.copy()
-        # Normalize column names so strategies always see Open/High/Low/Close/Volume
         df = _normalize_columns(df)
 
         if "Close" not in df.columns:
             raise BacktestError("DataFrame must have a 'Close' column after normalization")
+
+        # Drop rows where Close is NaN so equity math never sees NaN inputs
+        df = df.dropna(subset=["Close"])
+        if len(df) < 10:
+            raise InsufficientDataError("Too few valid Close bars after NaN drop")
 
         signals: pd.Series = strategy.generate_signals(df)
 
@@ -109,11 +104,11 @@ class BacktestEngine:
 
         capital    = self.initial_capital
         cash       = capital
-        position   = 0        # shares held
+        position   = 0
         avg_cost   = 0.0
         entry_date = None
         entry_price_fill = 0.0
-        equity     = []
+        equity: list[float] = []
         trades: list[Trade] = []
         total_charges = 0.0
 
@@ -124,7 +119,7 @@ class BacktestEngine:
             # ─ Entry: BUY signal and flat ─────────────────────────────────
             if sig == 1 and position == 0 and close > 0:
                 fill_price = close * (1 + self.slippage_pct)
-                qty        = int(cash * 0.95 / fill_price)   # use 95% of cash
+                qty        = int(cash * 0.95 / fill_price)
                 if qty > 0:
                     turnover          = fill_price * qty
                     charges           = _nse_charges(turnover, "BUY")
@@ -191,19 +186,33 @@ class BacktestEngine:
                 exit_reason  = "END_OF_DATA",
             ))
 
-        # ─ Build equity series — initialise to capital if no trades ───────
+        # ─ Build equity series ─────────────────────────────────────────────
+        # CRITICAL: when no trades fired (e.g. signals all 0), equity list will
+        # be full of cash=capital values. We must never produce a NaN series.
         if equity:
             equity_series = pd.Series(equity, index=df.index, dtype=float)
         else:
-            equity_series = pd.Series(capital, index=df.index, dtype=float)
+            # Absolute fallback — stays at initial capital
+            equity_series = pd.Series(
+                [float(capital)] * len(df), index=df.index, dtype=float
+            )
 
-        bh_series     = capital * (1 + df["Close"].pct_change().fillna(0)).cumprod()
-        dd_series     = (equity_series / equity_series.cummax()) - 1
+        # Ensure no NaN bleeds in from edge cases
+        equity_series = equity_series.fillna(method="ffill").fillna(float(capital))
+
+        bh_series  = capital * (1 + df["Close"].pct_change().fillna(0)).cumprod()
+        dd_series  = (equity_series / equity_series.cummax()) - 1
 
         final_cap    = float(equity_series.iloc[-1])
         total_return = (final_cap - capital) / capital * 100
         bh_return    = (float(bh_series.iloc[-1]) - capital) / capital * 100
         max_dd       = float(dd_series.min() * 100)
+
+        # Guard: if no trades, equity is flat → max_dd = 0, final_cap = capital
+        if not trades:
+            max_dd    = 0.0
+            final_cap = float(capital)
+            total_return = 0.0
 
         strat_rets = equity_series.pct_change().fillna(0)
         std        = float(strat_rets.std())
