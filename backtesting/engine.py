@@ -9,6 +9,10 @@ Phase-02 accuracy fixes applied:
   - Forced-close fix  : equity[-1] set correctly after last-bar close
   - Min-bars guard    : 10 bars (strategy warmup is strategy's responsibility)
 
+Signal-safety fix (Python 3.13 + pandas 2.x):
+  - signals NaN cleaned BEFORE shift so astype(int) never sees NaN
+  - MultiIndex columns from yfinance 2.x flattened before dropna
+
 Accurate NSE cost model:
     - Slippage  : configurable fill-price offset (default 0.05%)
     - Brokerage : flat Rs20 per executed order (Zerodha MIS default)
@@ -41,7 +45,6 @@ if TYPE_CHECKING:
 log = get_logger("backtesting.engine")
 
 # ── Interval → annualisation periods ────────────────────────────────────
-# Used for Sharpe ratio: sqrt(PERIODS[interval])
 PERIODS: dict[str, int] = {
     "1m":  252 * 375,
     "3m":  252 * 125,
@@ -55,32 +58,22 @@ PERIODS: dict[str, int] = {
 }
 
 # ── NSE charge constants ─────────────────────────────────────────────────
-_BROKERAGE_FLAT   = 20.0        # Rs20 per order (intraday MIS)
-_STT_MIS_SELL     = 0.00025     # 0.025% on sell turnover (intraday MIS)
-_STT_CNC_SIDE     = 0.001       # 0.1%  on each side    (delivery CNC)
-_EXCHANGE_CHARGE  = 0.0000335   # NSE transaction charge
-_SEBI_CHARGE      = 0.000001    # Rs10/crore
-_STAMP_BUY        = 0.00003     # 0.003% on buy turnover
-_GST              = 0.18        # 18% on brokerage + exchange
+_BROKERAGE_FLAT  = 20.0
+_STT_MIS_SELL    = 0.00025
+_STT_CNC_SIDE    = 0.001
+_EXCHANGE_CHARGE = 0.0000335
+_SEBI_CHARGE     = 0.000001
+_STAMP_BUY       = 0.00003
+_GST             = 0.18
 
 
 def _nse_charges(turnover: float, side: str, product_type: str = "MIS") -> float:
-    """Total NSE charges in INR for one leg of a trade.
-
-    Args:
-        turnover     : fill_price * quantity
-        side         : 'BUY' or 'SELL'
-        product_type : 'MIS' (intraday) or 'CNC' (delivery)
-    """
+    """Total NSE charges in INR for one leg of a trade."""
     brokerage = _BROKERAGE_FLAT
-
     if product_type == "CNC":
-        # Delivery: STT 0.1% on BOTH buy and sell sides
         stt = turnover * _STT_CNC_SIDE
     else:
-        # Intraday MIS: STT 0.025% on sell side only
         stt = turnover * _STT_MIS_SELL if side == "SELL" else 0.0
-
     exchange = turnover * _EXCHANGE_CHARGE
     sebi     = turnover * _SEBI_CHARGE
     stamp    = turnover * _STAMP_BUY if side == "BUY" else 0.0
@@ -89,25 +82,67 @@ def _nse_charges(turnover: float, side: str, product_type: str = "MIS") -> float
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize DataFrame columns to Title Case (Open/High/Low/Close/Volume)."""
+    """Normalize DataFrame columns to Title Case (Open/High/Low/Close/Volume).
+
+    Also handles:
+    - yfinance 2.x MultiIndex columns  e.g. ('Close', 'RELIANCE.NS')
+    - lowercase / UPPERCASE column names
+    """
+    # ── Flatten MultiIndex columns (yfinance 2.x multi-ticker format) ───
+    if isinstance(df.columns, pd.MultiIndex):
+        # Take the first level — ('Close','RELIANCE.NS') → 'Close'
+        df = df.copy()
+        df.columns = [str(c[0]) if isinstance(c, tuple) else str(c)
+                      for c in df.columns]
+
     rename = {}
     for orig in df.columns:
-        low = orig.strip().lower()
-        if low == "open":                       rename[orig] = "Open"
-        elif low == "high":                     rename[orig] = "High"
-        elif low == "low":                      rename[orig] = "Low"
-        elif low == "close":                    rename[orig] = "Close"
-        elif low in ("volume", "vol"):          rename[orig] = "Volume"
-        elif low in ("adj close", "adj_close"): rename[orig] = "Adj Close"
+        low = str(orig).strip().lower()
+        if low == "open":
+            rename[orig] = "Open"
+        elif low == "high":
+            rename[orig] = "High"
+        elif low == "low":
+            rename[orig] = "Low"
+        elif low == "close":
+            rename[orig] = "Close"
+        elif low in ("volume", "vol"):
+            rename[orig] = "Volume"
+        elif low in ("adj close", "adj_close"):
+            rename[orig] = "Adj Close"
     return df.rename(columns=rename)
+
+
+def _safe_signals(raw: pd.Series) -> np.ndarray:
+    """Convert a raw strategy signal Series to a clean int numpy array.
+
+    Handles the Python 3.13 + pandas 2.x issue where:
+      - rolling() produces float NaN in the warmup window
+      - astype(int) on a float-NaN Series raises OverflowError on Windows
+
+    Safe pipeline:
+      1. fillna(0)   — kill NaN FIRST, before any cast
+      2. shift(1)    — look-ahead bias fix (act on bar N+1)
+      3. fillna(0)   — shift introduces one new NaN at position 0
+      4. round()     — defensive: e.g. 0.9999 → 1 not 0
+      5. clip(-1, 1) — clamp to valid signal range
+      6. astype(int) — safe cast, no NaN present
+    """
+    return (
+        raw
+        .fillna(0)          # step 1 — NaN gone before any numeric op
+        .shift(1)           # step 2 — look-ahead fix
+        .fillna(0)          # step 3 — shift NaN at index 0
+        .round()            # step 4 — float drift guard
+        .clip(-1, 1)        # step 5 — clamp to {-1, 0, 1}
+        .astype(int)        # step 6 — safe, no NaN present
+        .to_numpy()
+    )
 
 
 class BacktestEngine:
     """Event-driven backtesting engine with accurate NSE cost simulation."""
 
-    # Minimum bars required AFTER NaN drop.
-    # 10 is the absolute floor — strategy warmup (e.g. SMA 50) is the
-    # strategy's responsibility, not the engine's.
     MIN_BARS = 10
 
     def __init__(
@@ -127,60 +162,73 @@ class BacktestEngine:
 
     def run(self, df: pd.DataFrame, strategy: "BaseStrategy") -> BacktestResult:
         """Run strategy on OHLCV df and return a fully populated BacktestResult."""
-        if df is None or df.empty or len(df) < self.MIN_BARS:
-            raise InsufficientDataError(f"Need at least {self.MIN_BARS} bars to backtest")
+        if df is None or df.empty:
+            raise InsufficientDataError("DataFrame is None or empty")
 
         df = df.copy()
         df = _normalize_columns(df)
 
         if "Close" not in df.columns:
-            raise BacktestError("DataFrame must have a 'Close' column after normalization")
-
-        # Drop rows where Close is NaN so equity math never sees NaN inputs
-        df = df.dropna(subset=["Close"])
-        if len(df) < self.MIN_BARS:
-            raise InsufficientDataError(
-                f"Too few valid Close bars after NaN drop (have {len(df)}, need {self.MIN_BARS})"
+            raise BacktestError(
+                f"No 'Close' column after normalization. "
+                f"Columns found: {list(df.columns)}"
             )
 
-        # ── Phase-02 FIX: look-ahead bias ─────────────────────────────────
-        # generate_signals() sees bar N data.  Shifting by 1 means the signal
-        # is ACTED on at bar N+1 — the earliest bar the signal can be known.
-        signals: pd.Series = strategy.generate_signals(df)
-        if len(signals) != len(df):
-            raise BacktestError("signals length must match df length")
-        signals = signals.shift(1).fillna(0).astype(int)   # ← look-ahead fix
+        # Drop rows where Close is NaN
+        df = df.dropna(subset=["Close"])
+        n_valid = len(df)
+        if n_valid < self.MIN_BARS:
+            raise InsufficientDataError(
+                f"Too few valid Close bars after NaN drop "
+                f"(have {n_valid}, need {self.MIN_BARS})"
+            )
+
+        # ── Generate signals then apply look-ahead fix safely ────────────
+        raw_signals: pd.Series = strategy.generate_signals(df)
+
+        if not isinstance(raw_signals, pd.Series):
+            raw_signals = pd.Series(raw_signals, index=df.index)
+
+        if len(raw_signals) != len(df):
+            raise BacktestError(
+                f"signals length {len(raw_signals)} != df length {len(df)}"
+            )
+
+        # Re-index to df to ensure alignment after any strategy internal ops
+        raw_signals = raw_signals.reindex(df.index)
+
+        # Safe conversion: fillna BEFORE shift BEFORE astype(int)
+        sig_arr = _safe_signals(raw_signals)
 
         strategy_name = getattr(strategy, "name", type(strategy).__name__)
 
-        capital    = self.initial_capital
-        cash       = capital
-        position   = 0
-        avg_cost   = 0.0
-        entry_date = None
+        capital   = self.initial_capital
+        cash      = capital
+        position  = 0
+        avg_cost  = 0.0
+        entry_date       = None
         entry_price_fill = 0.0
         equity: list[float] = []
         trades: list[Trade] = []
         total_charges = 0.0
         intraday = self.interval != "1d"
 
-        close_arr  = df["Close"].to_numpy(dtype=float)
-        open_arr   = df["Open"].to_numpy(dtype=float) if "Open" in df.columns else close_arr
-        sig_arr    = signals.to_numpy(dtype=int)
-        idx_arr    = df.index
+        close_arr = df["Close"].to_numpy(dtype=float)
+        open_arr  = df["Open"].to_numpy(dtype=float) if "Open" in df.columns else close_arr
+        idx_arr   = df.index
 
         for i in range(len(df)):
-            sig   = sig_arr[i]
-            close = close_arr[i]
+            sig   = int(sig_arr[i])
+            close = float(close_arr[i])
             ts    = idx_arr[i]
 
-            # ── Phase-02 FIX: intraday fill at next-bar open ───────────────
+            # Intraday: fill at next-bar open; daily: fill at close
             if intraday and i + 1 < len(df):
-                fill_open = open_arr[i + 1]
+                fill_open = float(open_arr[i + 1])
             else:
                 fill_open = close
 
-            # ─ Entry: BUY signal and flat ─────────────────────────────────
+            # ── BUY entry ───────────────────────────────────────────────
             if sig == 1 and position == 0 and close > 0:
                 fill_price = fill_open * (1 + self.slippage_pct)
                 qty        = int(cash * 0.95 / fill_price)
@@ -194,7 +242,7 @@ class BacktestEngine:
                     position          = qty
                     total_charges    += charges
 
-            # ─ Exit: SELL signal while in position ────────────────────────
+            # ── SELL exit ───────────────────────────────────────────────
             elif sig == -1 and position > 0 and close > 0:
                 fill_price  = fill_open * (1 - self.slippage_pct)
                 turnover    = fill_price * position
@@ -202,74 +250,64 @@ class BacktestEngine:
                 trade_cost  = avg_cost * position
                 gross_pnl   = (fill_price - avg_cost) * position
                 net_pnl     = gross_pnl - charges
-                # ── Phase-02 FIX: avg_win/loss as % of TRADE COST not capital
                 pnl_pct     = net_pnl / trade_cost * 100 if trade_cost > 0 else 0.0
                 cash       += turnover - charges
                 total_charges += charges
 
                 trades.append(Trade(
-                    symbol       = self.symbol,
-                    direction    = "LONG",
-                    entry_date   = entry_date,
-                    exit_date    = ts,
-                    entry_price  = round(entry_price_fill, 4),
-                    exit_price   = round(fill_price, 4),
-                    quantity     = position,
-                    pnl          = round(net_pnl, 4),
-                    pnl_pct      = round(pnl_pct, 4),
-                    exit_reason  = "SIGNAL",
+                    symbol      = self.symbol,
+                    direction   = "LONG",
+                    entry_date  = entry_date,
+                    exit_date   = ts,
+                    entry_price = round(entry_price_fill, 4),
+                    exit_price  = round(fill_price, 4),
+                    quantity    = position,
+                    pnl         = round(net_pnl, 4),
+                    pnl_pct     = round(pnl_pct, 4),
+                    exit_reason = "SIGNAL",
                 ))
+                position = 0
+                avg_cost = 0.0
 
-                position  = 0
-                avg_cost  = 0.0
+            equity.append(cash + position * close)
 
-            mark_to_market = position * close
-            equity.append(cash + mark_to_market)
-
-        # ── Phase-02 FIX: forced-close — no double-count ──────────────────
+        # ── Forced close at end of data ──────────────────────────────────
         if position > 0:
-            last_close   = float(df["Close"].iloc[-1])
-            fill_price   = last_close * (1 - self.slippage_pct)
-            turnover     = fill_price * position
-            charges      = _nse_charges(turnover, "SELL", self.product_type)
-            trade_cost   = avg_cost * position
-            gross_pnl    = (fill_price - avg_cost) * position
-            net_pnl      = gross_pnl - charges
-            pnl_pct      = net_pnl / trade_cost * 100 if trade_cost > 0 else 0.0
-            cash        += turnover - charges
+            last_close  = float(df["Close"].iloc[-1])
+            fill_price  = last_close * (1 - self.slippage_pct)
+            turnover    = fill_price * position
+            charges     = _nse_charges(turnover, "SELL", self.product_type)
+            trade_cost  = avg_cost * position
+            net_pnl     = (fill_price - avg_cost) * position - charges
+            pnl_pct     = net_pnl / trade_cost * 100 if trade_cost > 0 else 0.0
+            cash       += turnover - charges
             total_charges += charges
-            # Fix: position is now closed so equity = cash only (no MTM)
-            equity[-1]   = cash
+            equity[-1]  = cash  # position closed — no MTM
 
             trades.append(Trade(
-                symbol       = self.symbol,
-                direction    = "LONG",
-                entry_date   = entry_date,
-                exit_date    = df.index[-1],
-                entry_price  = round(entry_price_fill, 4),
-                exit_price   = round(fill_price, 4),
-                quantity     = position,
-                pnl          = round(net_pnl, 4),
-                pnl_pct      = round(pnl_pct, 4),
-                exit_reason  = "END_OF_DATA",
+                symbol      = self.symbol,
+                direction   = "LONG",
+                entry_date  = entry_date,
+                exit_date   = df.index[-1],
+                entry_price = round(entry_price_fill, 4),
+                exit_price  = round(fill_price, 4),
+                quantity    = position,
+                pnl         = round(net_pnl, 4),
+                pnl_pct     = round(pnl_pct, 4),
+                exit_reason = "END_OF_DATA",
             ))
 
-        # ── Build equity series ───────────────────────────────────────────
+        # ── Equity series ────────────────────────────────────────────────
         if equity:
             equity_series = pd.Series(equity, index=df.index, dtype=float)
         else:
             equity_series = pd.Series(
                 [float(capital)] * len(df), index=df.index, dtype=float
             )
-
         equity_series = equity_series.ffill().fillna(float(capital))
 
-        # ── Phase-02 FIX: correct buy-hold curve ─────────────────────────
-        # Old: capital * (1 + pct_change().fillna(0)).cumprod()  — off by one bar
-        # New: capital * (close / close[0])  — mathematically exact
-        bh_series  = capital * (df["Close"] / float(df["Close"].iloc[0]))
-
-        dd_series  = (equity_series / equity_series.cummax()) - 1
+        bh_series = capital * (df["Close"] / float(df["Close"].iloc[0]))
+        dd_series = (equity_series / equity_series.cummax()) - 1
 
         final_cap    = float(equity_series.iloc[-1])
         total_return = (final_cap - capital) / capital * 100
@@ -277,37 +315,31 @@ class BacktestEngine:
         max_dd       = float(dd_series.min() * 100)
 
         if not trades:
-            max_dd       = 0.0
+            max_dd = 0.0
             final_cap    = float(capital)
             total_return = 0.0
 
-        # ── Phase-02 FIX: interval-aware Sharpe annualisation ─────────────
         ann_periods = PERIODS.get(self.interval, 252)
         strat_rets  = equity_series.pct_change().fillna(0)
         std         = float(strat_rets.std())
         sharpe      = float(strat_rets.mean() / std * np.sqrt(ann_periods)) if std > 0 else 0.0
 
-        trades_pnl = [t.pnl for t in trades]
-        wins       = [p for p in trades_pnl if p > 0]
-        losses     = [p for p in trades_pnl if p <= 0]
-        n_trades   = len(trades_pnl)
-        win_rate   = len(wins) / n_trades * 100 if n_trades else 0.0
+        trades_pnl  = [t.pnl for t in trades]
+        wins        = [p for p in trades_pnl if p > 0]
+        losses      = [p for p in trades_pnl if p <= 0]
+        n_trades    = len(trades_pnl)
+        win_rate    = len(wins) / n_trades * 100 if n_trades else 0.0
 
-        # Phase-02 FIX: avg win/loss as % of trade cost, not % of total capital
         win_trades  = [t for t in trades if t.pnl > 0]
         loss_trades = [t for t in trades if t.pnl <= 0]
-        if win_trades:
-            avg_win = sum(
-                t.pnl / (t.entry_price * t.quantity) * 100 for t in win_trades
-            ) / len(win_trades)
-        else:
-            avg_win = 0.0
-        if loss_trades:
-            avg_loss = sum(
-                t.pnl / (t.entry_price * t.quantity) * 100 for t in loss_trades
-            ) / len(loss_trades)
-        else:
-            avg_loss = 0.0
+        avg_win  = (
+            sum(t.pnl / (t.entry_price * t.quantity) * 100 for t in win_trades)
+            / len(win_trades) if win_trades else 0.0
+        )
+        avg_loss = (
+            sum(t.pnl / (t.entry_price * t.quantity) * 100 for t in loss_trades)
+            / len(loss_trades) if loss_trades else 0.0
+        )
 
         pf_num = sum(wins)
         pf_den = abs(sum(losses))
