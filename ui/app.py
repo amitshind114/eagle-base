@@ -196,7 +196,7 @@ def home_page():
     col1.metric("Phase", "8 / 10", "Live Wired")
     col2.metric("Modules", "11", "All Live")
     col3.metric("Status", "Active", "Running")
-    col4.metric("Engine", "yfinance + NSE", "Connected")
+    col4.metric("Engine", "Angel One + NSE", "Connected")
     st.divider()
     st.subheader("📡 Market Snapshot — Nifty 50 Heatmap")
     NIFTY50 = {s.split(".")[0]: s for s in NIFTY50_SYMBOLS}
@@ -248,7 +248,7 @@ def data_page():
         if seg_f != "All": filtered = filtered[filtered["SEGMENT"]==seg_f]
         if exc_f != "All": filtered = filtered[filtered["EXCHANGE"]==exc_f]
         st.dataframe(filtered[["SYMBOL","NAME","SEGMENT","EXCHANGE","YF_SYMBOL"]].head(200),
-                     width='stretch', hide_index=True, height=200)
+                     hide_index=True, height=200, use_container_width=True)
         c2a,c2b,c2c = st.columns(3)
         selected_yf = c2a.text_input("Selected YF Symbol",value="",key="dss")
         period   = c2b.selectbox("Period",["1d","5d","1mo","3mo","6mo","1y","2y","5y"],index=4,key="dp_s")
@@ -281,7 +281,8 @@ def data_page():
                                   plot_bgcolor="rgba(0,0,0,0)",font_color="#ccc",
                                   xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(df.sort_index(ascending=False), width='stretch', height=300)
+                st.dataframe(df.sort_index(ascending=False), hide_index=False, height=300,
+                             use_container_width=True)
                 st.download_button("⬇️ Download CSV",df.to_csv(),f"{fetch_sym}_{period}.csv","text/csv")
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -317,7 +318,7 @@ def instruments_page():
     if exc_f != "All": filtered = filtered[filtered["EXCHANGE"]==exc_f]
     st.caption(f"**{len(filtered):,}** results matched")
     st.dataframe(filtered[["SYMBOL","NAME","SEGMENT","EXCHANGE","YF_SYMBOL"]].head(500),
-                 width='stretch', hide_index=True, height=350)
+                 hide_index=True, height=350, use_container_width=True)
 
 
 # ─── BACKTESTING — Phase 07 rewrite ──────────────────────────────────────────
@@ -328,7 +329,6 @@ def backtesting_page():
 
     tab_single, tab_multi = st.tabs(["📊 Single Stock", "🏆 Multi-Stock Leaderboard"])
 
-    # ── Single Stock ──────────────────────────────────────────────────────────
     with tab_single:
         col1,col2,col3,col4,col5 = st.columns(5)
         bt_symbol  = col1.text_input("Symbol",value="RELIANCE.NS",key="bt_sym")
@@ -433,7 +433,6 @@ def backtesting_page():
                 except Exception as e:
                     st.error(f"Request failed: {e}")
 
-    # ── Multi-Stock Leaderboard ───────────────────────────────────────────────
     with tab_multi:
         st.subheader("🏆 Multi-Stock Leaderboard")
         st.caption("Run a strategy across a universe — compare results by Sharpe, CAGR, MaxDD")
@@ -514,7 +513,7 @@ def backtesting_page():
                         .background_gradient(subset=["Return%"],cmap="RdYlGn",vmin=-30,vmax=60)
                         .background_gradient(subset=["Sharpe"],cmap="RdYlGn",vmin=-1,vmax=3)
                         .background_gradient(subset=["MaxDD%"],cmap="RdYlGn_r",vmin=-60,vmax=0),
-                    width='stretch', height=600
+                    use_container_width=True, height=600
                 )
                 top5 = df_lb.head(5)
                 fig = px.bar(top5,x="Symbol",y="Sharpe",color="Return%",
@@ -631,7 +630,7 @@ def strategies_page():
         {"Name":"MACD Signal","Type":"Momentum","Status":"Active","Params":"fast=12, slow=26, sig=9","Sharpe":1.31,"Return":"16.8%"},
     ]
     df_strat = pd.DataFrame(STRATEGIES)
-    st.dataframe(df_strat, width='stretch', hide_index=True)
+    st.dataframe(df_strat, hide_index=True, use_container_width=True)
     st.divider()
     col1,col2 = st.columns(2)
     with col1:
@@ -680,7 +679,8 @@ def reporting_page():
         fig.update_layout(height=350,paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font_color="#ccc")
         st.plotly_chart(fig, use_container_width=True)
     with tab2:
-        st.dataframe(df_trades.sort_values("Date",ascending=False), width='stretch', height=350)
+        st.dataframe(df_trades.sort_values("Date",ascending=False), hide_index=True,
+                     height=350, use_container_width=True)
 
 
 # ─── RISK ─────────────────────────────────────────────────────────────────────
@@ -736,7 +736,10 @@ def paper_page():
             resp = requests.get(f"{API_BASE}/api/paper/snapshot",timeout=5)
             if resp.status_code == 200:
                 snap = resp.json()
-                api_online = True
+                if isinstance(snap, dict):
+                    api_online = True
+                else:
+                    snap = None
         except Exception:
             pass
 
@@ -761,7 +764,7 @@ def paper_page():
         if positions:
             df_pos = pd.DataFrame(positions)
             st.subheader("Open Positions")
-            st.dataframe(df_pos, width='stretch', hide_index=True)
+            st.dataframe(df_pos, hide_index=True, use_container_width=True)
         else:
             st.info("No open positions")
 
@@ -820,7 +823,6 @@ def live_page():
     st.caption("Deployment status · Active positions · Order log · Emergency controls")
     st.divider()
 
-    # ── Check API reachability ────────────────────────────────────────────────
     api_ok = False
     try:
         ping = requests.get(f"{API_BASE}/api/live/status", timeout=4)
@@ -835,7 +837,6 @@ def live_page():
             "All controls below are in **read-only / simulation mode**."
         )
 
-    # ── Tabs ──────────────────────────────────────────────────────────────────
     tab_status, tab_positions, tab_orders, tab_kill = st.tabs([
         "🟢 Deployment Status",
         "📊 Active Positions",
@@ -843,9 +844,7 @@ def live_page():
         "🔴 Kill Switch",
     ])
 
-    # ════════════════════════════════════════════════════════════════════════
-    # TAB 1 — Deployment Status
-    # ════════════════════════════════════════════════════════════════════════
+    # ── TAB 1 — Deployment Status ─────────────────────────────────────────────
     with tab_status:
         st.subheader("Deployed Strategies")
 
@@ -854,11 +853,13 @@ def live_page():
             try:
                 resp = requests.get(f"{API_BASE}/api/live/status", timeout=5)
                 if resp.status_code == 200:
-                    live_data = resp.json()
+                    parsed = resp.json()
+                    if isinstance(parsed, dict):
+                        live_data = parsed
             except Exception:
                 pass
 
-        # Fallback demo data when API is offline
+        # Fallback demo when API offline or returns unexpected type
         if live_data is None:
             live_data = {
                 "strategies": [
@@ -907,8 +908,10 @@ def live_page():
                 }
             }
 
-        # Engine KPIs
+        # Engine KPIs — guard against non-dict engine value
         eng = live_data.get("engine", {})
+        if not isinstance(eng, dict):
+            eng = {}
         e1,e2,e3,e4,e5 = st.columns(5)
         e1.metric("Engine Mode",   eng.get("mode","—"))
         e2.metric("Uptime",        f"{eng.get('uptime_hours',0):.1f}h")
@@ -917,8 +920,9 @@ def live_page():
         e5.metric("Free Capital",  f"₹{eng.get('free_capital',0):,.0f}")
         st.divider()
 
-        # Per-strategy cards
         strats = live_data.get("strategies", [])
+        if not isinstance(strats, list):
+            strats = []
         if not strats:
             st.info("No strategies deployed yet.")
         else:
@@ -946,7 +950,6 @@ def live_page():
                         if ac2.button(f"⏹ Stop {s['name']}", key=f"stop_{s['name']}"):
                             _live_action("stop", s["name"], api_ok)
 
-        # Deploy new strategy
         st.divider()
         st.subheader("🚀 Deploy New Strategy")
         d1,d2,d3 = st.columns(3)
@@ -975,9 +978,7 @@ def live_page():
             else:
                 st.success(f"✅ [Simulation] {dep_strategy} queued for {mode_str} deployment on {dep_symbol}")
 
-    # ════════════════════════════════════════════════════════════════════════
-    # TAB 2 — Active Positions
-    # ════════════════════════════════════════════════════════════════════════
+    # ── TAB 2 — Active Positions ──────────────────────────────────────────────
     with tab_positions:
         st.subheader("Active Positions — Live Book")
 
@@ -986,11 +987,12 @@ def live_page():
             try:
                 r = requests.get(f"{API_BASE}/api/live/positions", timeout=5)
                 if r.status_code == 200:
-                    positions_data = r.json()
+                    parsed = r.json()
+                    if isinstance(parsed, list):
+                        positions_data = parsed
             except Exception:
                 pass
 
-        # Fallback demo
         if positions_data is None:
             positions_data = [
                 {"Symbol":"RELIANCE.NS","Side":"LONG","Qty":50,"Avg Price":2810.5,
@@ -1010,9 +1012,7 @@ def live_page():
 
             st.dataframe(
                 df_pos.style.map(color_pnl, subset=["Unrealized PnL","Realized PnL"]),
-                width='stretch',
-                hide_index=True,
-                height=350,
+                hide_index=True, height=350, use_container_width=True,
             )
 
             total_unrealized = sum(p.get("Unrealized PnL",0) for p in positions_data)
@@ -1027,9 +1027,7 @@ def live_page():
         if col_ref.button("🔄 Refresh Positions", key="refresh_pos"):
             st.rerun()
 
-    # ════════════════════════════════════════════════════════════════════════
-    # TAB 3 — Order Log
-    # ════════════════════════════════════════════════════════════════════════
+    # ── TAB 3 — Order Log ─────────────────────────────────────────────────────
     with tab_orders:
         st.subheader("Order Log — Today")
 
@@ -1038,11 +1036,12 @@ def live_page():
             try:
                 r = requests.get(f"{API_BASE}/api/live/orders", timeout=5)
                 if r.status_code == 200:
-                    orders_data = r.json()
+                    parsed = r.json()
+                    if isinstance(parsed, list):
+                        orders_data = parsed
             except Exception:
                 pass
 
-        # Fallback demo
         if orders_data is None:
             now = datetime.datetime.now()
             orders_data = [
@@ -1070,9 +1069,7 @@ def live_page():
 
             st.dataframe(
                 df_ord.style.map(color_status, subset=["Status"]),
-                width='stretch',
-                hide_index=True,
-                height=400,
+                hide_index=True, height=400, use_container_width=True,
             )
 
             filled   = sum(1 for o in orders_data if o.get("Status")=="FILLED")
@@ -1092,9 +1089,7 @@ def live_page():
                 key="dl_orders",
             )
 
-    # ════════════════════════════════════════════════════════════════════════
-    # TAB 4 — Kill Switch
-    # ════════════════════════════════════════════════════════════════════════
+    # ── TAB 4 — Kill Switch ───────────────────────────────────────────────────
     with tab_kill:
         st.subheader("🔴 Emergency Controls")
         st.markdown("""
@@ -1174,7 +1169,9 @@ Use only in emergencies: runaway strategy, data feed failure, broker issues.
             try:
                 r = requests.get(f"{API_BASE}/api/live/audit", timeout=5)
                 if r.status_code == 200:
-                    audit_data = r.json()
+                    parsed = r.json()
+                    if isinstance(parsed, list):
+                        audit_data = parsed
             except Exception:
                 pass
 
@@ -1190,13 +1187,13 @@ Use only in emergencies: runaway strategy, data feed failure, broker issues.
             ]
 
         if audit_data:
-            st.dataframe(pd.DataFrame(audit_data), width='stretch', hide_index=True, height=250)
+            st.dataframe(pd.DataFrame(audit_data), hide_index=True,
+                         height=250, use_container_width=True)
         else:
             st.info("No audit events found.")
 
 
 def _live_action(action: str, strategy_name: str, api_ok: bool):
-    """Helper to call live action endpoints."""
     endpoint_map = {"pause": "/api/live/pause", "stop": "/api/live/stop"}
     endpoint = endpoint_map.get(action, "")
     if api_ok and endpoint:
