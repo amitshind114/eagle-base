@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 
 SEP = "-" * 60
 
-# Angel One NSE tokens to try for VEDANTA-EQ (in order)
 VEDANTA_TOKENS = [
     ("1660",  "VEDANTA NSE primary"),
     ("3063",  "VEDANTA NSE alt-1"),
@@ -33,15 +32,15 @@ def _login():
     broker = AngelOneBroker()
     ok = broker.login()
     if not ok:
-        print("[FAIL] Angel One login failed. Check credentials.")
+        print("[FAIL] Angel One login failed.")
         sys.exit(1)
     print(f"[OK]  Logged in as {os.getenv('ANGELONE_CLIENT_ID')}")
     return broker
 
 
 def _fetch_candles(broker, days: int = 365) -> pd.DataFrame:
-    to_dt   = datetime.now()
-    from_dt = to_dt - timedelta(days=days)
+    to_dt    = datetime.now()
+    from_dt  = to_dt - timedelta(days=days)
     from_str = from_dt.strftime("%Y-%m-%d %H:%M")
     to_str   = to_dt.strftime("%Y-%m-%d %H:%M")
 
@@ -74,15 +73,7 @@ def _fetch_candles(broker, days: int = 365) -> pd.DataFrame:
             print("empty")
 
     if not raw:
-        print()
-        print("[FAIL] All tokens returned empty data.")
-        print("       Run the token lookup below to find correct token:")
-        print()
-        print("  import requests")
-        print("  r = requests.get('https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json')")
-        print("  import json")
-        print("  data = r.json()")
-        print("  [x for x in data if 'VEDANTA' in x.get('name','') and x.get('exch_seg')=='NSE']")
+        print("[FAIL] All tokens returned empty. Check Angel One scrip master.")
         broker.logout()
         sys.exit(1)
 
@@ -107,10 +98,10 @@ def _run_backtest(df: pd.DataFrame) -> None:
     print(SEP)
 
     from backtesting.engine import BacktestEngine
-    from strategies.ema_cross import EmaCrossStrategy
+    from strategies.ema_cross import EMACrossStrategy
 
     engine = BacktestEngine(
-        strategy_cls=EmaCrossStrategy,
+        strategy_cls=EMACrossStrategy,
         symbol="VEDANTA",
         data=df,
         capital=100_000.0,
@@ -140,9 +131,9 @@ def _run_backtest(df: pd.DataFrame) -> None:
         print(f"  {'Entry':>12}  {'Exit':>12}  {'Side':>5}  {'P&L':>10}  {'Ret%':>7}")
         print(f"  {'':->12}  {'':->12}  {'':->5}  {'':->10}  {'':->7}")
         for t in result.trades[-5:]:
-            pnl     = getattr(t, 'pnl', 0)
-            ret     = getattr(t, 'return_pct', 0)
-            side    = getattr(t, 'side', '?')
+            pnl      = getattr(t, 'pnl', 0)
+            ret      = getattr(t, 'return_pct', 0)
+            side     = getattr(t, 'side', '?')
             entry_dt = getattr(t, 'entry_time', '?')
             exit_dt  = getattr(t, 'exit_time',  '?')
             print(f"  {str(entry_dt)[:10]:>12}  {str(exit_dt)[:10]:>12}  {str(side):>5}  {pnl:>10.2f}  {ret:>7.2f}%")
