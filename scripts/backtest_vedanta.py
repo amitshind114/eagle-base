@@ -8,7 +8,7 @@ Credentials from env vars (set in CMD before running):
 Run:
     python scripts\\backtest_vedanta.py
 
-No existing code is modified. This script is read-only against the codebase.
+No existing code is modified. Standalone script only.
 """
 
 from __future__ import annotations
@@ -20,10 +20,15 @@ from datetime import datetime, timedelta
 
 SEP = "-" * 60
 
+# Angel One NSE tokens to try for VEDANTA-EQ (in order)
+VEDANTA_TOKENS = [
+    ("1660",  "VEDANTA NSE primary"),
+    ("3063",  "VEDANTA NSE alt-1"),
+    ("14977", "VEDANTA NSE alt-2"),
+]
 
-# ------------------------------------------------------------------ helpers
 
-def _login() -> "AngelOneBroker":
+def _login():
     from brokers.adapters.angelone import AngelOneBroker
     broker = AngelOneBroker()
     ok = broker.login()
@@ -35,13 +40,8 @@ def _login() -> "AngelOneBroker":
 
 
 def _fetch_candles(broker, days: int = 365) -> pd.DataFrame:
-    """
-    Fetch daily OHLCV candles for VEDANTA-EQ from NSE.
-    Angel One token for VEDANTA on NSE = 1995 (official SmartAPI token).
-    """
     to_dt   = datetime.now()
     from_dt = to_dt - timedelta(days=days)
-
     from_str = from_dt.strftime("%Y-%m-%d %H:%M")
     to_str   = to_dt.strftime("%Y-%m-%d %H:%M")
 
@@ -51,30 +51,50 @@ def _fetch_candles(broker, days: int = 365) -> pd.DataFrame:
     print(f"         To   : {to_str}")
     print(SEP)
 
-    raw = broker.get_candles(
-        exchange="NSE",
-        symbol_token="1995",   # VEDANTA-EQ NSE token
-        interval="ONE_DAY",
-        from_date=from_str,
-        to_date=to_str,
-    )
+    raw = []
+    used_token = None
+    for token, label in VEDANTA_TOKENS:
+        print(f"  Trying token {token} ({label}) ...", end=" ")
+        try:
+            raw = broker.get_candles(
+                exchange="NSE",
+                symbol_token=token,
+                interval="ONE_DAY",
+                from_date=from_str,
+                to_date=to_str,
+            )
+        except Exception as e:
+            print(f"error: {e}")
+            raw = []
+        if raw:
+            print(f"OK ({len(raw)} bars)")
+            used_token = token
+            break
+        else:
+            print("empty")
 
     if not raw:
-        print("[FAIL] No candle data returned. Token or date range issue.")
+        print()
+        print("[FAIL] All tokens returned empty data.")
+        print("       Run the token lookup below to find correct token:")
+        print()
+        print("  import requests")
+        print("  r = requests.get('https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json')")
+        print("  import json")
+        print("  data = r.json()")
+        print("  [x for x in data if 'VEDANTA' in x.get('name','') and x.get('exch_seg')=='NSE']")
         broker.logout()
         sys.exit(1)
 
-    # Angel One returns [[timestamp, o, h, l, c, v], ...]
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
-
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df = df.dropna(subset=["open", "high", "low", "close"])
 
-    print(f"[OK]  {len(df)} candles fetched")
+    print()
+    print(f"[OK]  {len(df)} candles fetched  (token={used_token})")
     print(f"      First bar : {df['timestamp'].iloc[0].date()}")
     print(f"      Last bar  : {df['timestamp'].iloc[-1].date()}")
     print(f"      Last close: {df['close'].iloc[-1]:.2f}")
@@ -96,7 +116,6 @@ def _run_backtest(df: pd.DataFrame) -> None:
         capital=100_000.0,
         params={"fast": 9, "slow": 21},
     )
-
     result = engine.run()
 
     print()
@@ -121,9 +140,9 @@ def _run_backtest(df: pd.DataFrame) -> None:
         print(f"  {'Entry':>12}  {'Exit':>12}  {'Side':>5}  {'P&L':>10}  {'Ret%':>7}")
         print(f"  {'':->12}  {'':->12}  {'':->5}  {'':->10}  {'':->7}")
         for t in result.trades[-5:]:
-            pnl  = getattr(t, 'pnl', 0)
-            ret  = getattr(t, 'return_pct', 0)
-            side = getattr(t, 'side', '?')
+            pnl     = getattr(t, 'pnl', 0)
+            ret     = getattr(t, 'return_pct', 0)
+            side    = getattr(t, 'side', '?')
             entry_dt = getattr(t, 'entry_time', '?')
             exit_dt  = getattr(t, 'exit_time',  '?')
             print(f"  {str(entry_dt)[:10]:>12}  {str(exit_dt)[:10]:>12}  {str(side):>5}  {pnl:>10.2f}  {ret:>7.2f}%")
