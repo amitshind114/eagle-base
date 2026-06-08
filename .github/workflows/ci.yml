@@ -21,16 +21,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Smoke-test: verify all top-level packages import cleanly
+      # Smoke-test: verify ALL top-level packages import cleanly
       - name: Smoke import check
         run: |
           python -c "
+          # core
           import core.config, core.logger, core.db
-          import instruments.models, instruments.storage, instruments.resolver
+          # instruments
+          import instruments.models, instruments.storage, instruments.resolver, instruments.token_map
+          # backtesting
           import backtesting.engine, backtesting.metrics, backtesting.models
-          import backtesting.multi_runner
+          import backtesting.multi_runner, backtesting.walk_forward
+          # strategies & derivatives
           import strategies.sma_crossover
           import derivatives.options
+          # paper trading
+          import paper.portfolio, paper.executor, paper.broker
+          # api (all routers)
+          import api.main
+          import api.routers.data, api.routers.instruments
+          import api.routers.backtesting, api.routers.risk
+          import api.routers.paper, api.routers.live
           print('All smoke imports OK')
           "
         env:
