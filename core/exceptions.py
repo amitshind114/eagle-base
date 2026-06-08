@@ -14,7 +14,7 @@ class InsufficientDataError(EagleBaseError):
 
 
 class InstrumentNotFoundError(EagleBaseError):
-    """Raised when symbol is not resolvable."""
+    """Raised when symbol is not resolvable to a known instrument."""
 
 
 class InsufficientFundsError(EagleBaseError):
@@ -31,3 +31,11 @@ class StrategyError(EagleBaseError):
 
 class BacktestError(EagleBaseError):
     """Raised during backtesting failures."""
+
+
+class BrokerAuthError(EagleBaseError):
+    """Raised when broker login or token refresh fails."""
+
+
+class OrderError(EagleBaseError):
+    """Raised when an order placement or cancellation fails."""
