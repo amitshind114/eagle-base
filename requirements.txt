@@ -1,4 +1,4 @@
-# Eagle-Base Requirements — Push 0 patched
+# Eagle-Base Requirements
 
 # Core
 python-dotenv>=1.0.0
@@ -13,22 +13,14 @@ yfinance>=0.2.40
 requests>=2.31.0
 httpx>=0.24.0
 scipy>=1.11.0
-pandas-ta>=0.3.14b
+# pandas-ta is no longer on PyPI for Python >=3.11.
+# Install from source (latest commit on main branch):
+pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git@development
 pyarrow>=13.0.0
 matplotlib>=3.7.0
 
 # Broker auth
-# pyotp: generates live 6-digit TOTP at Angel One login time.
-# Never store the generated value — call pyotp.TOTP(secret).now() at each login.
 pyotp>=2.9.0
-
-# Angel One broker SDK
-# smartapi-python>=1.3.5
-
-# NSE instrument master
-# nsepython removed — unmaintained since 2022, NSE endpoints changed.
-# Primary source is now Angel One ScripMaster JSON (instruments/angel_master.py)
-# which also provides token, lot_size, and exchange columns needed for orders.
 
 # API
 fastapi>=0.104.0
@@ -43,3 +35,4 @@ pytest>=7.4.0
 pytest-cov>=4.1.0
 ruff>=0.1.0
 black>=23.0.0
+dateutils>=0.6.12
