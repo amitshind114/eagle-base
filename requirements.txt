@@ -1,4 +1,4 @@
-# Eagle-Base Requirements — Phase 1 hardened
+# Eagle-Base Requirements — Push 0 patched
 
 # Core
 python-dotenv>=1.0.0
@@ -17,9 +17,18 @@ pandas-ta>=0.3.14b
 pyarrow>=13.0.0
 matplotlib>=3.7.0
 
-# NSE instrument master sources (tries each in order, uses first that works)
-nsepython>=1.0.0
-# jugaad-trader>=2.5.0  # optional — uncomment if nsepython fails on your env
+# Broker auth
+# pyotp: generates live 6-digit TOTP at Angel One login time.
+# Never store the generated value — call pyotp.TOTP(secret).now() at each login.
+pyotp>=2.9.0
+
+# Angel One broker SDK
+# smartapi-python>=1.3.5
+
+# NSE instrument master
+# nsepython removed — unmaintained since 2022, NSE endpoints changed.
+# Primary source is now Angel One ScripMaster JSON (instruments/angel_master.py)
+# which also provides token, lot_size, and exchange columns needed for orders.
 
 # API
 fastapi>=0.104.0

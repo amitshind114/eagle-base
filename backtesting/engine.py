@@ -1,22 +1,20 @@
 """Core backtesting engine — orchestrator.
 
 Refactored (Phase 10):
-  engine.py is now a thin orchestrator of three independent components:
+  engine.py is a thin orchestrator of three independent components:
 
-    CostModel         — NSE charge calculation (brokerage, STT, exchange, GST…)
-    TradeSimulator    — event loop: buy/sell fills, equity curve, trade list
-    MetricsCalculator — Sharpe, drawdown, win-rate etc. (backtesting/metrics.py)
+    CostModel         — NSE charge calculation
+    TradeSimulator    — event loop: fills, equity curve, trade list
+    MetricsCalculator — Sharpe, drawdown, win-rate (backtesting/metrics.py)
 
-  BacktestEngine.run() calls these in sequence and returns BacktestResult.
-  Each component is independently testable.
-
-All Phase-02 accuracy fixes are preserved:
-  - Look-ahead bias   : signals.shift(1) via _safe_signals()
-  - Sharpe annualise  : interval-aware PERIODS dict
-  - Buy-hold curve    : capital * close/close[0]
-  - STT rate          : product_type param MIS/CNC
-  - Forced-close fix  : equity[-1] set correctly after last-bar close
-  - Min-bars guard    : 10 bars
+Fixes in this revision
+----------------------
+- H1 (tz alignment): df.index is stripped of timezone before any signal join.
+  yfinance returns tz-aware UTC; pandas-ta returns naive. Mismatched indexes
+  produce all-NaN signal columns — zero trades, no error. Fixed by calling
+  _strip_tz(df) before generate_signals().
+- H5 (freq='B' deprecation): all pd.date_range calls use pd.offsets.BDay()
+  instead of freq='B', which becomes ValueError in pandas 3.x.
 """
 
 from __future__ import annotations
@@ -37,7 +35,7 @@ log = get_logger("backtesting.engine")
 
 __all__ = ["BacktestEngine", "CostModel", "TradeSimulator"]
 
-# ── Interval → annualisation periods ────────────────────────────────────────
+# ── Interval → annualisation periods ─────────────────────────────────────────
 PERIODS: dict[str, int] = {
     "1m":  252 * 375,
     "3m":  252 * 125,
@@ -51,22 +49,29 @@ PERIODS: dict[str, int] = {
 }
 
 
+# ── Timezone normaliser ───────────────────────────────────────────────────────
+
+def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip timezone from DataFrame index so yfinance (UTC-aware) and
+    pandas-ta (tz-naive) indexes align correctly.
+
+    Without this, df.join(signals) or pd.concat silently produces all-NaN
+    signal columns — every backtest runs with zero trades.
+    """
+    if hasattr(df.index, "tz") and df.index.tz is not None:
+        df = df.copy()
+        df.index = df.index.tz_localize(None)
+    return df
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# CostModel — all NSE charge logic in one place
+# CostModel
 # ════════════════════════════════════════════════════════════════════════════
 
 class CostModel:
     """NSE transaction cost calculator.
 
-    Encapsulates every charge so strategies/tests can call it independently.
-
-    Charges included:
-        Brokerage : flat ₹20 per order (Zerodha / Angel One MIS default)
-        STT       : 0.025% sell-side (MIS) or 0.1% both sides (CNC delivery)
-        Exchange  : 0.00335% NSE transaction charge
-        SEBI      : 0.0001% on turnover
-        Stamp     : 0.003% on buy-side turnover
-        GST       : 18% on (brokerage + exchange charge)
+    Charges: Brokerage (₹20 flat), STT, Exchange, SEBI, Stamp, GST.
     """
 
     BROKERAGE_FLAT  = 20.0
@@ -81,14 +86,6 @@ class CostModel:
         self.product_type = product_type.upper()
 
     def charges(self, turnover: float, side: str) -> float:
-        """Total NSE charges in INR for one leg.
-
-        Args:
-            turnover : fill_price × qty (INR)
-            side     : 'BUY' | 'SELL'
-        Returns:
-            Total charges in INR (float)
-        """
         brokerage = self.BROKERAGE_FLAT
         if self.product_type == "CNC":
             stt = turnover * self.STT_CNC_SIDE
@@ -101,27 +98,15 @@ class CostModel:
         return brokerage + stt + exchange + sebi + stamp + gst
 
     def round_trip(self, buy_turnover: float, sell_turnover: float) -> float:
-        """Convenience: total charges for a complete round trip."""
         return self.charges(buy_turnover, "BUY") + self.charges(sell_turnover, "SELL")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TradeSimulator — event loop that turns signals into trades + equity curve
+# TradeSimulator
 # ════════════════════════════════════════════════════════════════════════════
 
 class TradeSimulator:
-    """Simulates trade execution on a signal array + OHLCV dataframe.
-
-    Responsible for:
-      - Applying slippage to fill prices
-      - Sizing each order (95% of available cash)
-      - Tracking cash, position, avg_cost
-      - Appending Trade objects
-      - Building the equity curve
-      - Forced close at end-of-data
-
-    Does NOT compute analytics — those stay in MetricsCalculator.
-    """
+    """Simulates trade execution on a signal array + OHLCV DataFrame."""
 
     def __init__(
         self,
@@ -142,19 +127,13 @@ class TradeSimulator:
         df: pd.DataFrame,
         sig_arr: np.ndarray,
     ) -> tuple[list[Trade], list[float]]:
-        """Simulate all trades.
-
-        Returns:
-            trades     : list[Trade]
-            equity     : list[float] — one value per bar
-        """
-        cash      = float(self.initial_capital)
-        position  = 0
-        avg_cost  = 0.0
-        entry_date        = None
-        entry_price_fill  = 0.0
-        trades: list[Trade] = []
-        equity: list[float] = []
+        cash             = float(self.initial_capital)
+        position         = 0
+        avg_cost         = 0.0
+        entry_date       = None
+        entry_price_fill = 0.0
+        trades: list[Trade]  = []
+        equity: list[float]  = []
 
         close_arr = df["Close"].to_numpy(dtype=float)
         open_arr  = df["Open"].to_numpy(dtype=float) if "Open" in df.columns else close_arr
@@ -165,22 +144,22 @@ class TradeSimulator:
             close = float(close_arr[i])
             ts    = idx_arr[i]
 
-            fill_open = float(open_arr[i + 1]) if (self.intraday and i + 1 < len(df)) else close
+            fill_open = (
+                float(open_arr[i + 1]) if (self.intraday and i + 1 < len(df)) else close
+            )
 
-            # BUY entry
             if sig == 1 and position == 0 and close > 0:
                 fill_price = fill_open * (1 + self.slippage_pct)
                 qty        = int(cash * 0.95 / fill_price)
                 if qty > 0:
-                    turnover          = fill_price * qty
-                    charges           = self.cost_model.charges(turnover, "BUY")
-                    cash             -= turnover + charges
-                    avg_cost          = fill_price
-                    entry_price_fill  = fill_price
-                    entry_date        = ts
-                    position          = qty
+                    turnover         = fill_price * qty
+                    charges          = self.cost_model.charges(turnover, "BUY")
+                    cash            -= turnover + charges
+                    avg_cost         = fill_price
+                    entry_price_fill = fill_price
+                    entry_date       = ts
+                    position         = qty
 
-            # SELL exit
             elif sig == -1 and position > 0 and close > 0:
                 fill_price = fill_open * (1 - self.slippage_pct)
                 turnover   = fill_price * position
@@ -209,14 +188,14 @@ class TradeSimulator:
 
         # Forced close at end-of-data
         if position > 0:
-            last_close  = float(df["Close"].iloc[-1])
-            fill_price  = last_close * (1 - self.slippage_pct)
-            turnover    = fill_price * position
-            charges     = self.cost_model.charges(turnover, "SELL")
-            trade_cost  = avg_cost * position
-            net_pnl     = (fill_price - avg_cost) * position - charges
-            pnl_pct     = net_pnl / trade_cost * 100 if trade_cost > 0 else 0.0
-            cash       += turnover - charges
+            last_close = float(df["Close"].iloc[-1])
+            fill_price = last_close * (1 - self.slippage_pct)
+            turnover   = fill_price * position
+            charges    = self.cost_model.charges(turnover, "SELL")
+            trade_cost = avg_cost * position
+            net_pnl    = (fill_price - avg_cost) * position - charges
+            pnl_pct    = net_pnl / trade_cost * 100 if trade_cost > 0 else 0.0
+            cash      += turnover - charges
             if equity:
                 equity[-1] = cash
 
@@ -236,9 +215,7 @@ class TradeSimulator:
         return trades, equity
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Signal helpers (unchanged from Phase-02)
-# ════════════════════════════════════════════════════════════════════════════
+# ── Signal helpers ────────────────────────────────────────────────────────────
 
 def _safe_signals(raw: pd.Series) -> np.ndarray:
     return (
@@ -260,11 +237,11 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename = {}
     for orig in df.columns:
         low = str(orig).strip().lower()
-        if low == "open":            rename[orig] = "Open"
-        elif low == "high":          rename[orig] = "High"
-        elif low == "low":           rename[orig] = "Low"
-        elif low == "close":         rename[orig] = "Close"
-        elif low in ("volume", "vol"): rename[orig] = "Volume"
+        if low == "open":                rename[orig] = "Open"
+        elif low == "high":              rename[orig] = "High"
+        elif low == "low":               rename[orig] = "Low"
+        elif low == "close":             rename[orig] = "Close"
+        elif low in ("volume", "vol"):   rename[orig] = "Volume"
         elif low in ("adj close", "adj_close"): rename[orig] = "Adj Close"
     return df.rename(columns=rename)
 
@@ -274,12 +251,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════════════════
 
 class BacktestEngine:
-    """Orchestrates CostModel + TradeSimulator + MetricsCalculator.
-
-    Usage (unchanged from before refactor):
-        engine = BacktestEngine(symbol="RELIANCE.NS", initial_capital=200_000)
-        result = engine.run(df, strategy)
-    """
+    """Orchestrates CostModel + TradeSimulator + MetricsCalculator."""
 
     MIN_BARS = 10
 
@@ -299,11 +271,11 @@ class BacktestEngine:
         self.product_type    = product_type.upper()
         self._cost_model     = CostModel(product_type)
         self._simulator      = TradeSimulator(
-            symbol=symbol,
-            initial_capital=initial_capital,
-            cost_model=self._cost_model,
-            slippage_pct=slippage_pct,
-            interval=interval,
+            symbol          = symbol,
+            initial_capital = initial_capital,
+            cost_model      = self._cost_model,
+            slippage_pct    = slippage_pct,
+            interval        = interval,
         )
 
     def run(self, df: pd.DataFrame, strategy: "BaseStrategy") -> BacktestResult:
@@ -312,6 +284,9 @@ class BacktestEngine:
             raise InsufficientDataError("DataFrame is None or empty")
 
         df = df.copy()
+
+        # FIX H1 — strip timezone so yfinance (UTC) and pandas-ta (naive) align
+        df = _strip_tz(df)
         df = _normalize_columns(df)
 
         if "Close" not in df.columns:
@@ -326,30 +301,31 @@ class BacktestEngine:
                 f"Too few valid bars (have {len(df)}, need {self.MIN_BARS})"
             )
 
-        # Generate + sanitise signals
         raw_signals: pd.Series = strategy.generate_signals(df)
         if not isinstance(raw_signals, pd.Series):
             raw_signals = pd.Series(raw_signals, index=df.index)
         if len(raw_signals) != len(df):
-            raise BacktestError(f"signals length {len(raw_signals)} != df length {len(df)}")
+            raise BacktestError(
+                f"signals length {len(raw_signals)} != df length {len(df)}"
+            )
         raw_signals = raw_signals.reindex(df.index)
         sig_arr = _safe_signals(raw_signals)
 
         strategy_name = getattr(strategy, "name", type(strategy).__name__)
 
-        # ── TradeSimulator ──────────────────────────────────────────────
         trades, equity_list = self._simulator.run(df, sig_arr)
 
-        # ── Equity / benchmark series ───────────────────────────────────
         capital = self.initial_capital
         if equity_list:
             equity_series = pd.Series(equity_list, index=df.index, dtype=float)
         else:
-            equity_series = pd.Series([float(capital)] * len(df), index=df.index, dtype=float)
+            equity_series = pd.Series(
+                [float(capital)] * len(df), index=df.index, dtype=float
+            )
         equity_series = equity_series.ffill().fillna(float(capital))
 
-        bh_series  = capital * (df["Close"] / float(df["Close"].iloc[0]))
-        dd_series  = (equity_series / equity_series.cummax()) - 1
+        bh_series = capital * (df["Close"] / float(df["Close"].iloc[0]))
+        dd_series = (equity_series / equity_series.cummax()) - 1
 
         final_cap    = float(equity_series.iloc[-1])
         total_return = (final_cap - capital) / capital * 100
@@ -357,11 +333,10 @@ class BacktestEngine:
         max_dd       = float(dd_series.min() * 100)
 
         if not trades:
-            max_dd = 0.0
+            max_dd       = 0.0
             final_cap    = float(capital)
             total_return = 0.0
 
-        # ── MetricsCalculator (interval-aware Sharpe) ───────────────────
         ann_periods = PERIODS.get(self.interval, 252)
         strat_rets  = equity_series.pct_change().fillna(0)
         std         = float(strat_rets.std())
@@ -383,11 +358,10 @@ class BacktestEngine:
             sum(t.pnl / (t.entry_price * t.quantity) * 100 for t in loss_trades)
             / len(loss_trades) if loss_trades else 0.0
         )
-        pf_num = sum(wins)
-        pf_den = abs(sum(losses))
+        pf_num        = sum(wins)
+        pf_den        = abs(sum(losses))
         profit_factor = round(pf_num / pf_den, 4) if pf_den > 0 else (999.0 if pf_num > 0 else 0.0)
 
-        # Total charges for logging
         total_charges = sum(
             self._cost_model.charges(t.entry_price * t.quantity, "BUY") +
             self._cost_model.charges(t.exit_price  * t.quantity, "SELL")
