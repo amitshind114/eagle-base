@@ -57,11 +57,11 @@ class RiskLimits:
         self._state = DailyState()
 
         cap = total_capital or float(os.environ.get("TOTAL_CAPITAL", "200000"))
-        self.total_capital     = cap
-        self.max_daily_loss    = max_daily_loss    or float(os.environ.get("MAX_DAILY_LOSS",    str(cap * 0.02)))
+        self.total_capital      = cap
+        self.max_daily_loss     = max_daily_loss    or float(os.environ.get("MAX_DAILY_LOSS",    str(cap * 0.02)))
         self.max_trades_per_day = max_trades_per_day or int(os.environ.get("MAX_TRADES_PER_DAY", "20"))
-        self.max_position_pct  = max_position_pct
-        self.max_drawdown_pct  = max_drawdown_pct
+        self.max_position_pct   = max_position_pct
+        self.max_drawdown_pct   = max_drawdown_pct
 
     def reset(self, capital: float | None = None) -> None:
         """Call at session start.  Optionally update total capital."""
@@ -79,31 +79,51 @@ class RiskLimits:
     ) -> None:
         """Raise RiskLimitBreached if any hard limit would be violated.
 
+        Check order (intentional):
+          1. Trade count cap   — cheapest check, no math
+          2. Drawdown % cap    — % based, independent of daily loss threshold;
+                                 evaluated first so overlapping PnL values
+                                 (e.g. -12k that triggers both drawdown AND
+                                 daily-loss) raise with the drawdown message
+          3. Daily loss cap    — absolute ₹ threshold
+          4. Position size cap — per-order value check
+
         Call BEFORE placing any order.  Does not mutate state.
         """
         with self._lock:
             self._auto_reset_if_new_day()
 
+            # 1. Trade count
             if self._state.trades_placed >= self.max_trades_per_day:
                 raise RiskLimitBreached(
                     f"Max trades per day ({self.max_trades_per_day}) reached"
                 )
 
-            if self._state.realized_pnl <= -abs(self.max_daily_loss):
-                raise RiskLimitBreached(
-                    f"Daily loss cap ₹{self.max_daily_loss:,.0f} hit "
-                    f"(current PnL ₹{self._state.realized_pnl:,.2f})"
-                )
-
+            # 2. Drawdown % — checked BEFORE daily loss so the two don't overlap
             if self.total_capital > 0:
-                drawdown = (self._state.equity_peak - (self.total_capital + self._state.realized_pnl))
-                drawdown_pct = drawdown / self._state.equity_peak if self._state.equity_peak else 0
+                drawdown = (
+                    self._state.equity_peak
+                    - (self.total_capital + self._state.realized_pnl)
+                )
+                drawdown_pct = (
+                    drawdown / self._state.equity_peak
+                    if self._state.equity_peak
+                    else 0
+                )
                 if drawdown_pct >= self.max_drawdown_pct:
                     raise RiskLimitBreached(
                         f"Max drawdown {self.max_drawdown_pct * 100:.1f}% breached "
                         f"(current {drawdown_pct * 100:.2f}%)"
                     )
 
+            # 3. Daily loss cap
+            if self._state.realized_pnl <= -abs(self.max_daily_loss):
+                raise RiskLimitBreached(
+                    f"Daily loss cap \u20b9{self.max_daily_loss:,.0f} hit "
+                    f"(current PnL \u20b9{self._state.realized_pnl:,.2f})"
+                )
+
+            # 4. Single-position size
             trade_value = qty * price
             if self.total_capital > 0 and trade_value / self.total_capital > self.max_position_pct:
                 raise RiskLimitBreached(
@@ -132,13 +152,13 @@ class RiskLimits:
         """Return a snapshot of current daily state — safe to log or display."""
         with self._lock:
             return {
-                "trades_placed":     self._state.trades_placed,
-                "max_trades":        self.max_trades_per_day,
-                "realized_pnl":      round(self._state.realized_pnl, 2),
-                "max_daily_loss":    -abs(self.max_daily_loss),
-                "equity_peak":       round(self._state.equity_peak, 2),
-                "total_capital":     self.total_capital,
-                "session_date":      self._state.session_date.isoformat(),
+                "trades_placed":  self._state.trades_placed,
+                "max_trades":     self.max_trades_per_day,
+                "realized_pnl":   round(self._state.realized_pnl, 2),
+                "max_daily_loss": -abs(self.max_daily_loss),
+                "equity_peak":    round(self._state.equity_peak, 2),
+                "total_capital":  self.total_capital,
+                "session_date":   self._state.session_date.isoformat(),
             }
 
     def _auto_reset_if_new_day(self) -> None:

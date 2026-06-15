@@ -36,16 +36,21 @@ DB_PATH = Path("eagle_base/data/instruments.db")
 
 _SCHEMA_VERSION = "1.0.0"
 
+# token and nse_symbol are included so Angel One broker token survives
+# the DB round-trip. Previously missing from _COLS meant _to_dict() produced
+# them but insert_bulk() silently dropped them, causing inst.token == '' on
+# every resolved instrument and Angel One 400 Bad Request on every order.
 _COLS = (
     "symbol", "name", "exchange", "segment",
     "isin", "lot_size", "tick_size",
     "expiry", "strike", "option_type",
     "underlying", "yf_symbol",
+    "token", "nse_symbol",
 )
 _COLS_SQL     = ", ".join(f"{c} TEXT" for c in _COLS)
 _PLACEHOLDERS = ", ".join("?" for _ in _COLS)
 
-# Segment → table mapping
+# Segment -> table mapping
 _SEG_TABLE: dict[str, str] = {
     "EQ":  "equity",
     "FUT": "futures",
@@ -84,6 +89,12 @@ class InstrumentStorage:
 
             for table in _ALL_TABLES:
                 conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({_COLS_SQL})")
+                # Add token/nse_symbol columns to existing DBs that predate this fix
+                for col in ("token", "nse_symbol"):
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                    except sqlite3.OperationalError:
+                        pass  # column already exists
                 conn.execute(
                     f"CREATE INDEX IF NOT EXISTS idx_{table}_symbol ON {table}(symbol)"
                 )
@@ -273,13 +284,12 @@ class InstrumentStore(InstrumentStorage):
         self.init_db()  # ensure schema exists on first use
 
     # ------------------------------------------------------------------
-    # Instrument ↔ dict helpers
+    # Instrument <-> dict helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _to_dict(inst) -> dict:
         """Convert an Instrument (dataclass/object) to a storage dict."""
-        # Support both dataclass (asdict) and plain objects with __dict__
         try:
             from dataclasses import asdict
             return asdict(inst)
@@ -288,7 +298,11 @@ class InstrumentStore(InstrumentStorage):
 
     @staticmethod
     def _from_dict(d: dict):
-        """Convert a raw storage dict to an Instrument object."""
+        """Convert a raw storage dict to an Instrument object.
+
+        token and nse_symbol are now explicitly passed so the Angel One
+        broker token survives the full write -> read round-trip.
+        """
         try:
             from instruments.models import Instrument
             return Instrument(
@@ -304,6 +318,8 @@ class InstrumentStore(InstrumentStorage):
                 option_type = d.get("option_type"),
                 underlying  = d.get("underlying"),
                 yf_symbol   = d.get("yf_symbol"),
+                token       = d.get("token", ""),
+                nse_symbol  = d.get("nse_symbol", ""),
             )
         except Exception as exc:
             log.warning("[store] _from_dict failed: %s — returning raw dict", exc)
@@ -330,7 +346,6 @@ class InstrumentStore(InstrumentStorage):
 
         Returns total rows inserted.
         """
-        # Group by table
         by_table: dict[str, list[dict]] = {t: [] for t in _ALL_TABLES}
         for inst in instruments:
             table = self._table_for(inst)
@@ -347,10 +362,9 @@ class InstrumentStore(InstrumentStorage):
     # ------------------------------------------------------------------
 
     def search(self, query: str, limit: int = 50):  # type: ignore[override]
-        """Search all tables, return list[Instrument] ordered EQ→IDX→FUT→CE→PE."""
+        """Search all tables, return list[Instrument] ordered EQ->IDX->FUT->CE->PE."""
         raw = self.search_raw(query, limit)
 
-        # Sort order: EQ first, then IDX, FUT, CE/PE
         _order = {"equity": 0, "indices": 1, "futures": 2, "options": 3}
         raw.sort(key=lambda d: _order.get(d.get("_table", "equity"), 9))
 
@@ -388,7 +402,6 @@ class InstrumentStore(InstrumentStorage):
         table = _SEG_TABLE.get(segment.upper(), "equity")
         rows  = self.list_all(table)
         insts = [self._from_dict(r) for r in rows]
-        # For options table, further filter by option_type
         if segment.upper() in ("CE", "PE"):
             insts = [i for i in insts if getattr(i, "option_type", None) == segment.upper()]
         return insts
@@ -413,7 +426,6 @@ class InstrumentStore(InstrumentStorage):
                     pass
         finally:
             conn.close()
-        # deduplicate, preserve order
         seen: set[str] = set()
         unique = []
         for sym in results:
@@ -442,7 +454,6 @@ class InstrumentStore(InstrumentStorage):
                 except sqlite3.OperationalError:
                     pass
 
-            # Options split by option_type
             for seg in ("CE", "PE"):
                 try:
                     row = conn.execute(
