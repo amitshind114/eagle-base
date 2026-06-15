@@ -4,21 +4,21 @@ Single entry point for executing signals through the paper trading engine.
 Simulates market impact and slippage before routing to PaperPortfolio.
 
 Signal flow:
-  Signal → RiskCheck → Slippage → MarketImpact → Portfolio.on_signal → ExecutionResult
+  Signal → PriceResolution → RiskGate (via Portfolio) → Slippage
+  → MarketImpact → Portfolio.on_signal → ExecutionResult
 
-Live price support:
-  Pass live_price=True and the executor will call
-  DataFetcher.fetch_latest_price(symbol) internally instead of using the
-  caller-supplied price.  This lets the scheduler call:
+Price resolution order:
+  1. Caller-supplied price > 0  → used as-is
+  2. price=0.0 + fetcher available → auto-fetch live price
+  3. price=0.0 + no fetcher        → ExecutionResult(success=False)
 
-      executor.execute("BUY", "RELIANCE", qty=10, live_price=True)
-
-  without the caller needing to fetch the price manually.
+This prevents silent ₹0 executions that corrupt position avg_cost.
 
 Usage:
     executor = PaperExecutor(portfolio, fetcher=data_fetcher)
     result = executor.execute("BUY", "RELIANCE", price=2500.0, qty=10)
     result = executor.execute("BUY", "RELIANCE", qty=10, live_price=True)
+    result = executor.execute("BUY", "RELIANCE", qty=10)  # auto-fetches if fetcher set
     print(result.success, result.exec_price, result.order_id)
 """
 
@@ -59,7 +59,7 @@ class PaperExecutor:
 
     Args:
         portfolio            : PaperPortfolio instance.
-        fetcher              : Optional DataFetcher used when live_price=True.
+        fetcher              : Optional DataFetcher used for live price resolution.
         slippage_bps         : One-way slippage in basis points (default 5).
         impact_participation : Fraction of avg_volume for impact calc (default 0.10).
     """
@@ -94,11 +94,11 @@ class PaperExecutor:
         Args:
             signal      : "BUY" or "SELL".
             symbol      : Instrument symbol (e.g. "RELIANCE.NS").
-            price       : Market price. Ignored when live_price=True.
+            price       : Market price.  If 0.0 and fetcher is available,
+                          a live price is fetched automatically.
             qty         : Number of shares.
             avg_volume  : Average daily volume for impact calc. 0 = skip.
-            live_price  : If True, fetches current price from DataFetcher.
-                          Requires fetcher to be set on __init__.
+            live_price  : If True, forces a live fetch even when price > 0.
 
         Returns:
             ExecutionResult.
@@ -112,32 +112,16 @@ class PaperExecutor:
                 reason=f"Invalid signal '{signal}'",
             )
 
-        # --- Live price fetch ---
-        if live_price:
-            if self._fetcher is None:
-                return ExecutionResult(
-                    success=False, order_id=None, symbol=symbol,
-                    signal=signal, quantity=qty, req_price=0.0,
-                    exec_price=0.0, slippage=0.0, impact=0.0,
-                    reason="live_price=True but no fetcher configured on PaperExecutor",
-                )
-            try:
-                price = self._fetcher.fetch_latest_price(symbol)
-                if not price or price <= 0:
-                    return ExecutionResult(
-                        success=False, order_id=None, symbol=symbol,
-                        signal=signal, quantity=qty, req_price=0.0,
-                        exec_price=0.0, slippage=0.0, impact=0.0,
-                        reason=f"Fetcher returned invalid price {price} for {symbol}",
-                    )
-                log.debug("[executor] live price %s = %.2f", symbol, price)
-            except Exception as exc:
-                return ExecutionResult(
-                    success=False, order_id=None, symbol=symbol,
-                    signal=signal, quantity=qty, req_price=0.0,
-                    exec_price=0.0, slippage=0.0, impact=0.0,
-                    reason=f"live_price fetch error: {exc}",
-                )
+        # --- Price resolution ---
+        resolved_price, err = self._resolve_price(symbol, price, live_price)
+        if err:
+            return ExecutionResult(
+                success=False, order_id=None, symbol=symbol,
+                signal=signal, quantity=qty, req_price=price,
+                exec_price=0.0, slippage=0.0, impact=0.0,
+                reason=err,
+            )
+        price = resolved_price
 
         slippage = self.simulate_slippage(price, side_up)
         impact   = self.simulate_impact(qty, avg_volume) if avg_volume > 0 else 0.0
@@ -163,7 +147,7 @@ class PaperExecutor:
                 success=False, order_id=None, symbol=symbol,
                 signal=signal, quantity=qty, req_price=price,
                 exec_price=exec_price, slippage=slippage, impact=impact,
-                reason="Portfolio rejected order (risk check or corruption guard)",
+                reason="Portfolio rejected order (risk gate, cash check, or corruption guard)",
             )
 
         return ExecutionResult(
@@ -171,6 +155,47 @@ class PaperExecutor:
             signal=signal, quantity=qty, req_price=price,
             exec_price=exec_price, slippage=slippage, impact=impact,
         )
+
+    # ------------------------------------------------------------------
+    # Price resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_price(self, symbol: str, price: float, force_live: bool) -> tuple[float, str]:
+        """Resolve the execution price.
+
+        Returns (price, error_string).  error_string is empty on success.
+        """
+        # Explicit live fetch requested
+        if force_live:
+            return self._fetch_live(symbol, price)
+
+        # Caller supplied a valid price — use it
+        if price > 0:
+            return price, ""
+
+        # price=0.0 — auto-fetch if fetcher is available
+        if self._fetcher is not None:
+            log.debug("[executor] price=0 for %s — auto-fetching live price", symbol)
+            return self._fetch_live(symbol, price)
+
+        # No price, no fetcher — hard failure
+        return 0.0, (
+            f"price=0.0 for {symbol} and no fetcher configured on PaperExecutor. "
+            "Pass price > 0 or inject a DataFetcher."
+        )
+
+    def _fetch_live(self, symbol: str, fallback: float) -> tuple[float, str]:
+        """Fetch live price from self._fetcher.  Returns (price, error)."""
+        if self._fetcher is None:
+            return 0.0, "live_price=True but no fetcher configured on PaperExecutor"
+        try:
+            fetched = self._fetcher.fetch_latest_price(symbol)
+            if not fetched or fetched <= 0:
+                return 0.0, f"Fetcher returned invalid price {fetched} for {symbol}"
+            log.debug("[executor] live price %s = %.2f", symbol, fetched)
+            return fetched, ""
+        except Exception as exc:
+            return 0.0, f"live_price fetch error for {symbol}: {exc}"
 
     # ------------------------------------------------------------------
     # Simulation helpers

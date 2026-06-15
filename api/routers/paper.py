@@ -1,14 +1,17 @@
-"""Paper trading API router — Phase 07 NEW.
+"""Paper trading API router — Phase 07.
 
 Endpoints:
   POST /api/paper/signal    — fire a signal → paper trade executed
   GET  /api/paper/positions — all open positions
   GET  /api/paper/snapshot  — full portfolio snapshot (cash, positions, pnl)
-  GET  /api/paper/trades    — today's trade log
+  GET  /api/paper/trades    — today’s trade log
   GET  /api/paper/status    — portfolio health check
 
-The router lazily imports PaperPortfolio so the API starts even if
-the paper module has import errors (provides a degraded response).
+Market-hours guard:
+  fire_signal() checks MarketCalendar.is_market_open() before executing.
+  Returns HTTP 422 with minutes_to_open when market is closed.
+  Pass allow_outside_hours=true in the request body to override (e.g.
+  for backtests or forced paper fills during pre-open testing).
 """
 
 from __future__ import annotations
@@ -20,10 +23,12 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from core.calendar import calendar as market_cal
+
 log = logging.getLogger("api.paper")
 router = APIRouter()
 
-# ── Lazy portfolio singleton ─────────────────────────────────────────────────
+# ── Lazy portfolio singleton ───────────────────────────────────────────────────────────────────
 _portfolio = None
 
 def _get_portfolio():
@@ -35,20 +40,21 @@ def _get_portfolio():
             try:
                 _portfolio.restore()
             except Exception:
-                pass  # fresh portfolio if restore fails
+                pass
         except ImportError as e:
             log.warning("[paper router] PaperPortfolio not available: %s", e)
     return _portfolio
 
 
-# ── Request / Response models ────────────────────────────────────────────────
+# ── Request / Response models ───────────────────────────────────────────────────────────
 
 class SignalRequest(BaseModel):
-    symbol:    str
-    signal:    int          # 1 = BUY, -1 = SELL, 0 = HOLD
-    price:     float
-    quantity:  int   = 1
-    strategy:  str   = "manual"
+    symbol:               str
+    signal:               int     # 1 = BUY, -1 = SELL, 0 = HOLD
+    price:                float
+    quantity:             int   = 1
+    strategy:             str   = "manual"
+    allow_outside_hours:  bool  = False  # set True to bypass market-hours guard
 
 
 class PositionOut(BaseModel):
@@ -60,7 +66,7 @@ class PositionOut(BaseModel):
     pnl_pct:        float
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────────────
 
 @router.post("/signal")
 def fire_signal(req: SignalRequest):
@@ -69,35 +75,62 @@ def fire_signal(req: SignalRequest):
     signal=1  → BUY  qty shares at price
     signal=-1 → SELL qty shares at price
     signal=0  → HOLD (no-op, returns current position)
+
+    Market-hours guard:
+        Rejects execution when NSE is closed unless
+        allow_outside_hours=true is set in the request body.
+        Returns HTTP 422 with detail including minutes_to_open.
     """
     portfolio = _get_portfolio()
     if portfolio is None:
         raise HTTPException(status_code=503, detail="Paper portfolio not available")
 
+    # HOLD is always allowed — no execution, no market needed
     if req.signal == 0:
         return {"action": "HOLD", "symbol": req.symbol, "price": req.price}
 
+    # ── Market-hours guard ─────────────────────────────────────────
+    if not req.allow_outside_hours and not market_cal.is_market_open():
+        mins = market_cal.minutes_to_open()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error":           "market_closed",
+                "message":         "NSE is not in session. Use allow_outside_hours=true to override.",
+                "minutes_to_open": mins,
+                "is_trading_day":  market_cal.is_trading_day(),
+            },
+        )
+
     side = "BUY" if req.signal == 1 else "SELL"
     try:
-        portfolio.on_signal(
-            signal=req.signal,
+        order_id = portfolio.on_signal(
+            signal=side,
             symbol=req.symbol,
             price=req.price,
             qty=req.quantity,
         )
+        if order_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Order rejected by portfolio (risk gate, insufficient cash, or position check).",
+            )
         try:
             portfolio.persist()
         except Exception as pe:
             log.warning("[paper router] persist failed: %s", pe)
 
         return {
-            "action":   side,
-            "symbol":   req.symbol,
-            "price":    req.price,
-            "quantity": req.quantity,
-            "strategy": req.strategy,
-            "cash":     round(portfolio.cash, 2),
+            "action":    side,
+            "symbol":    req.symbol,
+            "price":     req.price,
+            "quantity":  req.quantity,
+            "strategy":  req.strategy,
+            "order_id":  order_id,
+            "cash":      round(portfolio.cash, 2),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -117,8 +150,7 @@ def get_positions():
             if qty == 0:
                 continue
             avg = getattr(pos, "avg_cost", 0) or getattr(pos, "average_price", 0)
-            # Fetch live price via yfinance (best-effort)
-            ltp = avg  # fallback to avg if fetch fails
+            ltp = avg
             try:
                 import yfinance as yf
                 hist = yf.Ticker(sym).history(period="1d")
@@ -154,15 +186,12 @@ def get_snapshot():
             "daily_pnl": 0,
             "positions": [],
         }
-
     try:
         snap = portfolio.snapshot()
-        # snapshot() returns a PortfolioSnapshot dataclass or dict
         if hasattr(snap, "__dict__"):
             snap = snap.__dict__
         return snap
     except Exception as e:
-        # Fallback: build snapshot manually
         try:
             cash = round(portfolio.cash, 2)
             positions_resp = get_positions()["positions"]
@@ -182,13 +211,10 @@ def get_snapshot():
 
 @router.get("/trades")
 def get_trades(date_filter: Optional[str] = None):
-    """Return trade log. Pass ?date_filter=YYYY-MM-DD to filter by day.
-    Defaults to today's trades.
-    """
+    """Return trade log. Pass ?date_filter=YYYY-MM-DD to filter by day."""
     portfolio = _get_portfolio()
     if portfolio is None:
         return {"trades": [], "note": "paper portfolio unavailable"}
-
     try:
         trade_book = portfolio.trade_book
         if date_filter:
@@ -199,7 +225,6 @@ def get_trades(date_filter: Optional[str] = None):
             ]
         else:
             trades = trade_book.today() if hasattr(trade_book, "today") else trade_book.trades
-
         trade_list = []
         for t in trades:
             side_val = t.side.value if hasattr(t.side, "value") else str(t.side)
@@ -233,6 +258,8 @@ def paper_status():
             "status":      "ok",
             "cash":        cash,
             "n_positions": n_positions,
+            "market_open": market_cal.is_market_open(),
+            "trading_day": market_cal.is_trading_day(),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}

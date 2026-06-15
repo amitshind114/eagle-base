@@ -10,6 +10,8 @@ Key guarantees:
     sum(BUY trades) - sum(SELL trades) for every symbol.
   - If corruption detected, self._corrupted = True and all new orders are
     blocked until manual reconciliation.
+  - on_signal() runs RiskManager.check() BEFORE cash/position guards so
+    drawdown, daily-loss, and position-size caps are always enforced.
 
 Usage:
     portfolio = PaperPortfolio(cash=500_000.0)
@@ -56,6 +58,26 @@ class PortfolioSnapshot:
     corrupted:        bool = False
 
 
+def _build_default_risk_manager():
+    """Build a RiskManager from Settings defaults.
+
+    Imported lazily to avoid circular imports and to keep paper/ independent
+    of risk/ at module load time.
+    """
+    try:
+        from core.config import settings
+        from risk.limits import RiskManager
+        return RiskManager(
+            max_daily_loss=settings.max_daily_loss,
+            max_drawdown_pct=settings.max_drawdown_pct,
+            max_position_size=settings.max_position_exposure_pct * settings.default_capital / 100,
+            max_trades_per_day=200,   # generous paper-trading default
+        )
+    except Exception as exc:
+        log.warning("[portfolio] Could not build RiskManager: %s — risk gate disabled", exc)
+        return None
+
+
 class PaperPortfolio:
     """Full paper trading portfolio: cash + books + atomic persistence."""
 
@@ -64,6 +86,7 @@ class PaperPortfolio:
         cash: float = 500_000.0,
         db_path: Path = DB_PATH,
         fetcher=None,
+        risk_manager=None,
     ) -> None:
         self.cash           = cash
         self._initial_cash  = cash
@@ -74,6 +97,8 @@ class PaperPortfolio:
         self._last_prices:  dict[str, float] = {}
         self._fetcher       = fetcher          # optional DataFetcher for MTM prices
         self._corrupted:    bool = False       # set True if restore detects mismatch
+        # RiskManager gate — built from settings if not injected
+        self._risk_manager  = risk_manager if risk_manager is not None else _build_default_risk_manager()
 
     # ------------------------------------------------------------------
     # Corruption guard
@@ -104,8 +129,9 @@ class PaperPortfolio:
     ) -> Optional[str]:
         """Process a trading signal end-to-end.
 
-        Flow: Signal → CorruptionGuard → RiskCheck → OrderBook.place
-              → OrderBook.fill → TradeBook.add → PositionBook.update → cash adjust
+        Flow: Signal → CorruptionGuard → RiskGate → CashCheck
+              → OrderBook.place → OrderBook.fill → TradeBook.add
+              → PositionBook.update → cash adjust
 
         Returns order_id on success, None on rejection.
         """
@@ -113,7 +139,25 @@ class PaperPortfolio:
 
         side = OrderSide.BUY if signal.upper() == "BUY" else OrderSide.SELL
 
-        # --- Risk check ---
+        # --- Risk gate (drawdown / daily-loss / position-size caps) ---
+        if self._risk_manager is not None:
+            try:
+                pnl = self.daily_pnl()
+                order_value = price * qty
+                self._risk_manager.check(
+                    pnl=pnl,
+                    capital=self._initial_cash,
+                    trade_value=order_value,
+                )
+            except Exception as exc:
+                # Catches RiskLimitBreached and any unexpected errors
+                log.warning(
+                    "[portfolio] RISK GATE BLOCKED %s %s x%d @ %.2f: %s",
+                    signal.upper(), symbol, qty, price, exc,
+                )
+                return None
+
+        # --- Cash / position check ---
         if side == OrderSide.BUY:
             required_cash = price * qty * (1 + slippage_pct)
             if required_cash > self.cash:
@@ -191,7 +235,7 @@ class PaperPortfolio:
     # ------------------------------------------------------------------
 
     def daily_pnl(self) -> float:
-        """Realized PnL from today's trades PLUS unrealized PnL at live prices.
+        """Realized PnL from today’s trades PLUS unrealized PnL at live prices.
 
         If a DataFetcher was injected, calls fetch_latest_price() for every
         open position so MTM is current.  Falls back to last known prices if
@@ -246,21 +290,12 @@ class PaperPortfolio:
     # ------------------------------------------------------------------
 
     def persist(self) -> None:
-        """Atomically save portfolio state to SQLite.
-
-        All three book writes happen inside a single BEGIN IMMEDIATE
-        transaction under WAL mode.  If the process dies at any point,
-        SQLite rolls back the entire transaction — no partial state is
-        ever committed.
-        """
+        """Atomically save portfolio state to SQLite."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self._db_path))
         try:
-            # WAL mode: readers don't block writers; crash-safe
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-
-            # Schema creation outside the transaction (DDL is auto-committed)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     trade_id    TEXT PRIMARY KEY,
@@ -289,11 +324,7 @@ class PaperPortfolio:
                 )
             """)
             conn.commit()
-
-            # --- Single atomic transaction covering ALL three books ---
             conn.execute("BEGIN IMMEDIATE")
-
-            # 1. Trade book
             for t in self.trade_book.all():
                 conn.execute(
                     "INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?)",
@@ -303,19 +334,14 @@ class PaperPortfolio:
                         t.timestamp.isoformat(), t.notes,
                     ),
                 )
-
-            # 2. Position book (full replace)
             conn.execute("DELETE FROM positions")
             for pos in self.position_book.all_open():
                 conn.execute(
                     "INSERT INTO positions VALUES (?,?,?,?)",
                     (pos.symbol, pos.quantity, pos.avg_cost, pos.current_price),
                 )
-
-            # 3. Meta (cash + last prices)
             conn.execute(
-                "INSERT OR REPLACE INTO meta VALUES ('cash', ?)",
-                (str(self.cash),),
+                "INSERT OR REPLACE INTO meta VALUES ('cash', ?)", (str(self.cash),),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO meta VALUES ('last_prices', ?)",
@@ -325,10 +351,8 @@ class PaperPortfolio:
                 "INSERT OR REPLACE INTO meta VALUES ('persisted_at', ?)",
                 (datetime.now().isoformat(),),
             )
-
             conn.execute("COMMIT")
             log.info("[portfolio] Persisted atomically to %s", self._db_path)
-
         except Exception:
             conn.execute("ROLLBACK")
             log.exception("[portfolio] persist() FAILED — rolled back")
@@ -341,26 +365,13 @@ class PaperPortfolio:
     # ------------------------------------------------------------------
 
     def restore(self) -> bool:
-        """Restore portfolio state from SQLite, then verify integrity.
-
-        Integrity rule:
-            For every symbol in position_book:
-                position.quantity == sum(BUY qty) - sum(SELL qty) across all trades
-
-        If any symbol violates this rule:
-            - Log CRITICAL with full detail
-            - Set self._corrupted = True
-            - All subsequent on_signal() calls will raise RuntimeError
-
-        Returns True if data was found, False if database does not exist.
-        """
+        """Restore portfolio state from SQLite, then verify integrity."""
         if not self._db_path.exists():
             log.info("[portfolio] No saved state — starting fresh")
             return False
 
         conn = sqlite3.connect(str(self._db_path))
         try:
-            # Cash + last prices
             try:
                 row = conn.execute("SELECT value FROM meta WHERE key='cash'").fetchone()
                 if row:
@@ -370,8 +381,6 @@ class PaperPortfolio:
                     self._last_prices = json.loads(row[0])
             except Exception as exc:
                 log.warning("[portfolio] restore meta: %s", exc)
-
-            # Trades
             try:
                 for row in conn.execute("SELECT * FROM trades").fetchall():
                     trade = Trade(
@@ -383,8 +392,6 @@ class PaperPortfolio:
                     self.trade_book.add(trade)
             except Exception as exc:
                 log.warning("[portfolio] restore trades: %s", exc)
-
-            # Positions
             try:
                 for row in conn.execute("SELECT * FROM positions").fetchall():
                     from paper.models import Position
@@ -395,7 +402,6 @@ class PaperPortfolio:
                     self.position_book._positions[pos.symbol] = pos
             except Exception as exc:
                 log.warning("[portfolio] restore positions: %s", exc)
-
         finally:
             conn.close()
 
@@ -403,20 +409,11 @@ class PaperPortfolio:
             "[portfolio] Restored: cash=%.0f positions=%d trades=%d",
             self.cash, self.position_book.position_count(), len(self.trade_book),
         )
-
-        # --- Integrity check ---
         self._verify_integrity()
         return True
 
     def _verify_integrity(self) -> None:
-        """Verify position_book is consistent with trade_book.
-
-        For each symbol that has an open position, the net quantity derived
-        from the trade log must equal the stored position quantity.
-        Sets self._corrupted = True on any mismatch.
-        """
         from collections import defaultdict
-
         net_qty: dict[str, int] = defaultdict(int)
         for trade in self.trade_book.all():
             if trade.side == OrderSide.BUY:
@@ -430,33 +427,22 @@ class PaperPortfolio:
             if pos.quantity != expected:
                 log.critical(
                     "[portfolio] INTEGRITY MISMATCH for %s: "
-                    "position_book=%d, trade_book_net=%d. "
-                    "Manual reconciliation required.",
+                    "position_book=%d, trade_book_net=%d.",
                     pos.symbol, pos.quantity, expected,
                 )
                 corruption_found = True
-
-        # Also check for net_qty > 0 but no position entry
         for symbol, qty in net_qty.items():
             if qty > 0 and self.position_book.get(symbol) is None:
                 log.critical(
                     "[portfolio] INTEGRITY MISMATCH: trade_book shows %d net %s "
-                    "but no position entry found.",
-                    qty, symbol,
+                    "but no position entry found.", qty, symbol,
                 )
                 corruption_found = True
-
         if corruption_found:
             self._corrupted = True
-            log.critical(
-                "[portfolio] State marked CORRUPTED — no new orders until reconciled."
-            )
+            log.critical("[portfolio] State marked CORRUPTED — no new orders until reconciled.")
         else:
             log.info("[portfolio] Integrity check PASSED.")
-
-    # ------------------------------------------------------------------
-    # Repr
-    # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
         snap = self.snapshot()
