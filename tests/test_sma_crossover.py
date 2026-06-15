@@ -1,4 +1,5 @@
-"""Phase 10a — SmaCrossover strategy unit tests.
+# -*- coding: utf-8 -*-
+"""Phase 10a -- SmaCrossover strategy unit tests.
 
 Covers:
   SmaCrossover (strategies/sma_crossover.py + strategies/base.py)
@@ -54,9 +55,9 @@ from strategies.sma_crossover import SmaCrossover
 from strategies.base import _STRATEGY_REGISTRY
 
 
-# ────────────────────────────────────────────────────────────────────────────
-HELPERS
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
 
 def _uptrend_df(n=100, start=100.0, step=1.0) -> pd.DataFrame:
     """Monotone rising close series."""
@@ -94,9 +95,9 @@ def _crossover_df(fast: int = 20, slow: int = 50, cross_at: int = 60) -> pd.Data
     return pd.DataFrame({"Close": close, "High": close + 1, "Low": close - 1}, index=idx)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-SmaCrossover — instantiation & metadata
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SmaCrossover -- instantiation & metadata
+# ---------------------------------------------------------------------------
 
 class TestSmaCrossoverInit:
     def test_default_params(self):
@@ -139,9 +140,9 @@ class TestSmaCrossoverInit:
         assert "SMA Crossover" in repr(s)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-generate_signals()
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# generate_signals()
+# ---------------------------------------------------------------------------
 
 class TestGenerateSignals:
     def test_returns_series(self):
@@ -188,9 +189,9 @@ class TestGenerateSignals:
         assert (s == -1).any()
 
 
-# ────────────────────────────────────────────────────────────────────────────
-on_bar()
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# on_bar()
+# ---------------------------------------------------------------------------
 
 class TestOnBar:
     def test_returns_zero_when_too_short(self):
@@ -237,9 +238,9 @@ class TestOnBar:
                 assert result in (-1, 0)  # might be 0 if not exact crossover bar
 
 
-# ────────────────────────────────────────────────────────────────────────────
-validate_params()
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# validate_params()
+# ---------------------------------------------------------------------------
 
 class TestValidateParams:
     def test_valid_params(self):
@@ -258,9 +259,9 @@ class TestValidateParams:
         assert SmaCrossover().validate_params({"fast": "ten", "slow": 30}) is False
 
 
-# ────────────────────────────────────────────────────────────────────────────
-@register_strategy
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# @register_strategy
+# ---------------------------------------------------------------------------
 
 class TestRegistry:
     def test_sma_crossover_in_registry(self):

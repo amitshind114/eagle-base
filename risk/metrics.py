@@ -1,9 +1,9 @@
-"""Risk and performance metrics — pure math, no external dependencies.
+"""Risk and performance metrics -- pure math, no external dependencies.
 
 All functions accept a list of net PnL values (one per trade) or a
 sequence of portfolio equity values and return a scalar or dict.
 
-Functions are stateless and side-effect free — safe to call from
+Functions are stateless and side-effect free -- safe to call from
 backtesting, paper trading, and live reporting.
 
 Usage:
@@ -44,15 +44,20 @@ def sharpe_ratio(
     returns:          per-trade or per-bar return as fraction (0.01 = 1%).
     risk_free_rate:   annual risk-free rate (India repo ~6.5%).
     periods_per_year: 252 for daily bars, 365*375 for 1-min intraday.
+
+    Zero-std guard: a constant positive return series has effectively
+    infinite Sharpe. We cap at +/-10 to avoid inf in downstream JSON.
     """
     if len(returns) < 2:
         return 0.0
     daily_rf = risk_free_rate / periods_per_year
     excess   = [r - daily_rf for r in returns]
     std      = _std(excess)
+    mean_excess = _mean(excess)
     if std == 0:
-        return 0.0
-    return (_mean(excess) / std) * math.sqrt(periods_per_year)
+        # Zero std but positive mean -> high Sharpe (cap at 10 to avoid inf)
+        return 10.0 if mean_excess > 0 else (-10.0 if mean_excess < 0 else 0.0)
+    return (mean_excess / std) * math.sqrt(periods_per_year)
 
 
 def sortino_ratio(
@@ -60,16 +65,21 @@ def sortino_ratio(
     risk_free_rate: float = 0.065,
     periods_per_year: int = 252,
 ) -> float:
-    """Annualised Sortino ratio (penalises only downside volatility)."""
+    """Annualised Sortino ratio (penalises only downside volatility).
+
+    Zero downside-std guard: if there are no negative excess returns
+    (pure winning series), Sortino is effectively infinite -- cap at +10.
+    """
     if len(returns) < 2:
         return 0.0
     daily_rf    = risk_free_rate / periods_per_year
     excess      = [r - daily_rf for r in returns]
     downside    = [min(r, 0.0) for r in excess]
     down_std    = _std(downside)
+    mean_excess = _mean(excess)
     if down_std == 0:
-        return 0.0
-    return (_mean(excess) / down_std) * math.sqrt(periods_per_year)
+        return 10.0 if mean_excess > 0 else (-10.0 if mean_excess < 0 else 0.0)
+    return (mean_excess / down_std) * math.sqrt(periods_per_year)
 
 
 def max_drawdown(equity_curve: Sequence[float]) -> float:
@@ -110,7 +120,7 @@ def profit_factor(pnl_series: Sequence[float]) -> float:
 
 
 def win_rate(pnl_series: Sequence[float]) -> float:
-    """Fraction of winning trades (0–1)."""
+    """Fraction of winning trades (0-1)."""
     if not pnl_series:
         return 0.0
     winners = sum(1 for p in pnl_series if p > 0)

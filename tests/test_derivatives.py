@@ -1,23 +1,23 @@
-"""Phase 9 — Derivatives unit tests.
+"""Phase 9 -- Derivatives unit tests.
 
 Covers:
   BlackScholes pricer (pure math)
   [x] ATM call price > 0
   [x] ATM put price > 0
   [x] Put-call parity: C - P = S*e^(-qT) - K*e^(-rT)
-  [x] Deep ITM call ≈ intrinsic value
-  [x] Deep OTM call ≈ 0
+  [x] Deep ITM call ~= intrinsic value
+  [x] Deep OTM call ~= 0
   [x] Zero expiry returns 0 price
   [x] Zero sigma returns 0 price (degenerate)
-  [x] Higher sigma → higher call price
-  [x] Higher spot → higher call price
-  [x] Longer expiry → higher call price (time value)
+  [x] Higher sigma -> higher call price
+  [x] Higher spot -> higher call price
+  [x] Longer expiry -> higher call price (time value)
 
-  BlackScholes — Greeks
+  BlackScholes -- Greeks
   [x] Call delta in (0, 1)
   [x] Put delta in (-1, 0)
-  [x] ATM call delta ≈ 0.5
-  [x] ATM put delta ≈ -0.5
+  [x] ATM call delta ~= 0.5
+  [x] ATM put delta ~= -0.5
   [x] Gamma > 0
   [x] Gamma is same for call and put
   [x] Theta < 0 for call (time decay)
@@ -31,9 +31,9 @@ Covers:
   [x] greeks() delta matches delta() directly
   [x] Zero T: gamma=0, theta=0, vega=0, rho=0
 
-  BlackScholes — known numerical values
+  BlackScholes -- known numerical values
   [x] ATM 30-day NIFTY call within range of textbook value
-  [x] Delta sum call+put ≈ 1 (digital identity)
+  [x] Delta sum call+put ~= 1 (digital identity)
 
   OptionContract
   [x] mid() = (bid+ask)/2 when both > 0
@@ -77,9 +77,9 @@ from derivatives.options import (
 )
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Helpers
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 @pytest.fixture()
 def atm_bs():
@@ -108,9 +108,9 @@ def _make_close_series(n=500, trend=0.0003, noise=0.015, seed=42) -> pd.DataFram
     return pd.DataFrame({"Close": close}, index=idx)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# BlackScholes — price
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# BlackScholes -- price
+# ---------------------------------------------------------------------------
 
 class TestBSPrice:
     def test_atm_call_price_positive(self, atm_bs):
@@ -128,7 +128,7 @@ class TestBSPrice:
         assert abs((C - P) - rhs) < 0.01
 
     def test_deep_itm_call_near_intrinsic(self, itm_call):
-        """Deep ITM call ≈ S - K*e^(-rT)."""
+        """Deep ITM call ~= S - K*e^(-rT)."""
         C = itm_call.price("CE")
         intrinsic = itm_call.S - itm_call.K * math.exp(-itm_call.r * itm_call.T)
         assert abs(C - intrinsic) < 50.0
@@ -161,9 +161,9 @@ class TestBSPrice:
         assert abs(bs.price("CE") - bs.price("C"))    < 0.001
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# BlackScholes — Greeks
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# BlackScholes -- Greeks
+# ---------------------------------------------------------------------------
 
 class TestBSGreeks:
     def test_call_delta_in_range(self, atm_bs):
@@ -175,10 +175,12 @@ class TestBSGreeks:
         assert -1 < d < 0
 
     def test_atm_call_delta_near_half(self, atm_bs):
-        assert abs(atm_bs.delta("CE") - 0.5) < 0.05
+        # ATM call delta N(d1) ~= 0.5514 for T=30/365, sigma=0.18 -- tolerance 0.06
+        assert abs(atm_bs.delta("CE") - 0.5) < 0.06
 
     def test_atm_put_delta_near_minus_half(self, atm_bs):
-        assert abs(atm_bs.delta("PE") + 0.5) < 0.05
+        # ATM put delta N(d1)-1 ~= -0.4486 for T=30/365, sigma=0.18 -- tolerance 0.06
+        assert abs(atm_bs.delta("PE") + 0.5) < 0.06
 
     def test_gamma_positive(self, atm_bs):
         assert atm_bs.gamma() > 0
@@ -219,7 +221,7 @@ class TestBSGreeks:
         assert bs.rho("CE") == 0.0
 
     def test_delta_identity_call_minus_put(self, atm_bs):
-        """delta_call - delta_put = e^(-qT) ≈ 1 for q=0."""
+        """delta_call - delta_put = e^(-qT) ~= 1 for q=0."""
         dc = atm_bs.delta("CE")
         dp = atm_bs.delta("PE")
         assert abs((dc - dp) - math.exp(-atm_bs.q * atm_bs.T)) < 0.001
@@ -233,14 +235,13 @@ class TestBSGreeks:
     def test_higher_vol_higher_vega_exposure(self):
         bs_lo = BlackScholes(S=22500, K=22500, T=30/365, r=0.065, sigma=0.10)
         bs_hi = BlackScholes(S=22500, K=22500, T=30/365, r=0.065, sigma=0.30)
-        # Both vega > 0; higher vol ATM typically has similar vega — just check positivity
         assert bs_lo.vega() > 0
         assert bs_hi.vega() > 0
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # OptionContract
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 class TestOptionContract:
     def test_mid_with_bid_ask(self):
@@ -274,13 +275,13 @@ class TestOptionContract:
         assert c.option_type == "PE"
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # OptionChainLoader
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 class TestOptionChainLoader:
     def test_no_api_no_db_returns_list(self):
-        """No API, no DB — should fail gracefully and return a list."""
+        """No API, no DB -- should fail gracefully and return a list."""
         loader = OptionChainLoader(api_client=None)
         result = loader.get_chain("NIFTY")
         assert isinstance(result, list)
@@ -313,15 +314,15 @@ class TestOptionChainLoader:
         assert expiry_date > date.today()
 
     def test_get_atm_strike_fallback_rounding(self):
-        """Empty chain → fallback to round(spot/50)*50."""
+        """Empty chain -> fallback to round(spot/50)*50."""
         loader = OptionChainLoader(api_client=None)
         atm = loader.get_atm_strike("FAKESYM", spot=22475.0)
         assert atm == round(22475.0 / 50) * 50
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # CoveredCallStrategy
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 class TestCoveredCallStrategy:
     @pytest.fixture()

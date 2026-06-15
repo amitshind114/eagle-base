@@ -1,4 +1,5 @@
-"""Phase 10b — backtesting.MetricsCalculator unit tests.
+# -*- coding: utf-8 -*-
+"""Phase 10b -- backtesting.MetricsCalculator unit tests.
 
 Covers:
   MetricsCalculator (backtesting/metrics.py)
@@ -38,9 +39,9 @@ import pytest
 from backtesting.metrics import MetricsCalculator
 
 
-# ────────────────────────────────────────────────────────────────────────────
-Stubs — avoid importing real BacktestResult to keep tests self-contained
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Stubs -- avoid importing real BacktestResult to keep tests self-contained
+# ---------------------------------------------------------------------------
 
 @dataclass
 class _Trade:
@@ -58,16 +59,16 @@ def _result(equity: list[float], pnls: list[float] | None = None) -> _Result:
     return _Result(equity_curve=equity, trades=trades)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-MetricsCalculator
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# MetricsCalculator
+# ---------------------------------------------------------------------------
 
 class TestMetricsCalculator:
     @pytest.fixture()
     def calc(self):
         return MetricsCalculator()
 
-    # Edge cases — bad input
+    # Edge cases -- bad input
     def test_empty_equity_returns_error(self, calc):
         r = _result([])
         assert "error" in calc.compute(r)
@@ -110,7 +111,7 @@ class TestMetricsCalculator:
         assert calc.compute(r)["max_drawdown_pct"] == 0.0
 
     def test_max_dd_correct_for_known_series(self, calc):
-        # peak=110_000, trough=88_000 → dd = 20%
+        # peak=110_000, trough=88_000 --> dd = 20%
         eq = [100_000, 110_000, 88_000, 95_000, 100_000]
         r  = _result(eq)
         dd = calc.compute(r)["max_drawdown_pct"]
@@ -141,7 +142,7 @@ class TestMetricsCalculator:
         assert calc.compute(r)["profit_factor"] == 0.0
 
     def test_profit_factor_known_series(self, calc):
-        # gross_profit=300, gross_loss=100 → pf=3.0
+        # gross_profit=300, gross_loss=100 --> pf=3.0
         eq = list(np.linspace(100_000, 120_000, 252))
         r  = _result(eq, pnls=[100.0, 200.0, -100.0])
         assert abs(calc.compute(r)["profit_factor"] - 3.0) < 0.001

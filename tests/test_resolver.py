@@ -1,4 +1,5 @@
-"""Phase 10c — InstrumentResolver + helper function unit tests.
+# -*- coding: utf-8 -*-
+"""Phase 10c -- InstrumentResolver + helper function unit tests.
 
 Covers:
   to_yf_symbol()  (pure function, no I/O)
@@ -22,7 +23,7 @@ Covers:
   [x] all builtins have non-empty symbol
   [x] all builtins have non-empty exchange
 
-  InstrumentResolver (pure / in-memory tests only — no live DB)
+  InstrumentResolver (pure / in-memory tests only -- no live DB)
   [x] resolve() returns None for empty string
   [x] resolve() finds RELIANCE from builtins
   [x] resolve() finds NIFTY from builtins
@@ -53,9 +54,9 @@ from instruments.resolver import (
 from instruments.models import Instrument
 
 
-# ────────────────────────────────────────────────────────────────────────────
-to_yf_symbol() — pure function
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# to_yf_symbol() -- pure function
+# ---------------------------------------------------------------------------
 
 class TestToYfSymbol:
     def test_nse_symbol_gets_ns_suffix(self):
@@ -78,9 +79,9 @@ class TestToYfSymbol:
         assert result == "RELIANCE.NS"
 
 
-# ────────────────────────────────────────────────────────────────────────────
-to_angel_symbol() — pure function
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# to_angel_symbol() -- pure function
+# ---------------------------------------------------------------------------
 
 class TestToAngelSymbol:
     def test_strips_ns_suffix(self):
@@ -96,9 +97,9 @@ class TestToAngelSymbol:
         assert to_angel_symbol("reliance.ns") == "RELIANCE"
 
 
-# ────────────────────────────────────────────────────────────────────────────
-_BUILTIN_INSTRUMENTS
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# _BUILTIN_INSTRUMENTS
+# ---------------------------------------------------------------------------
 
 class TestBuiltins:
     def test_nifty_present(self):
@@ -120,13 +121,13 @@ class TestBuiltins:
         assert all(i.exchange for i in _BUILTIN_INSTRUMENTS)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-InstrumentResolver
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# InstrumentResolver
+# ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
 def resolver():
-    """Single InstrumentResolver per test module — uses in-memory SQLite."""
+    """Single InstrumentResolver per test module -- uses in-memory SQLite."""
     return InstrumentResolver()
 
 

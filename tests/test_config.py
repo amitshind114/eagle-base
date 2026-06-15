@@ -1,4 +1,5 @@
-"""Phase 10d — core.config.Settings unit tests.
+# -*- coding: utf-8 -*-
+"""Phase 10d -- core.config.Settings unit tests.
 
 Covers:
   Settings (core/config.py, pydantic-settings)
@@ -47,9 +48,9 @@ import pytest
 from core.config import Settings, settings
 
 
-# ────────────────────────────────────────────────────────────────────────────
-Defaults
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
 
 class TestSettingsDefaults:
     @pytest.fixture()
@@ -106,9 +107,9 @@ class TestSettingsDefaults:
         assert s.angel_totp_secret == ""
 
 
-# ────────────────────────────────────────────────────────────────────────────
-Types
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
 
 class TestSettingsTypes:
     def test_default_capital_is_float(self):
@@ -124,9 +125,9 @@ class TestSettingsTypes:
         assert isinstance(Settings().paper_brokerage_pct, float)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-Env-var overrides (monkeypatch — never touches real .env)
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Env-var overrides (monkeypatch -- never touches real .env)
+# ---------------------------------------------------------------------------
 
 class TestSettingsEnvOverride:
     def test_debug_env_override(self, monkeypatch):
@@ -145,9 +146,9 @@ class TestSettingsEnvOverride:
         assert s.max_open_positions == 10
 
 
-# ────────────────────────────────────────────────────────────────────────────
-Module-level singleton
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
 
 class TestSettingsSingleton:
     def test_singleton_is_settings_instance(self):
