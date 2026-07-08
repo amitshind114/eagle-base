@@ -17,7 +17,7 @@ Usage::
     cls = get_strategy_class("ema_cross")
     runner = cls(symbol="RELIANCE", capital=50000.0, params={})
 
-    all_ids = list_strategies()   # ["ema_cross", ...]
+    all_ids = list_strategies()   # ["ema_cross", "triple_ema", ...]
 """
 
 from __future__ import annotations
@@ -97,8 +97,14 @@ def strategy_info(strategy_id: str) -> dict:
 def _auto_register() -> None:
     """Register all strategies defined in the strategies package."""
     from strategies.ema_cross import EMACrossStrategy
+    from strategies.triple_ema import TripleEMAStrategy
+
     register(EMACrossStrategy)
-    logger.info(f"[registry] Auto-registered {len(_REGISTRY)} strategy/ies: {list_strategies()}")
+    register(TripleEMAStrategy)
+
+    logger.info(
+        f"[registry] Auto-registered {len(_REGISTRY)} strategy/ies: {list_strategies()}"
+    )
 
 
 _auto_register()

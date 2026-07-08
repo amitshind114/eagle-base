@@ -10,5 +10,9 @@ Import strategies here so the registry auto-discovers them on import.
 """
 
 from strategies.ema_cross import EMACrossStrategy
+from strategies.triple_ema import TripleEMAStrategy
 
-__all__ = ["EMACrossStrategy"]
+__all__ = [
+    "EMACrossStrategy",
+    "TripleEMAStrategy",
+]
